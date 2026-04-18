@@ -1,15 +1,61 @@
 # Pi Memory Extension Prototype
 
-A small **Graphiti-lite** local memory prototype for a coding-agent / Pi CLI style extension.
+[![CI](https://github.com/vulh1209/pi-memory-extension/actions/workflows/ci.yml/badge.svg)](https://github.com/vulh1209/pi-memory-extension/actions/workflows/ci.yml)
+[![Publish Package](https://github.com/vulh1209/pi-memory-extension/actions/workflows/publish.yml/badge.svg)](https://github.com/vulh1209/pi-memory-extension/actions/workflows/publish.yml)
 
-## What is included
+A small **Graphiti-lite** local memory prototype for Pi CLI / coding-agent style workflows.
+
+## Features
 
 - SQLite schema with temporal facts, provenance episodes, checkpoints, and FTS5
 - TypeScript repository layer using Node's built-in `node:sqlite`
 - Lightweight local hashing embedder for semantic-ish retrieval without external APIs
-- Demo ingestion + retrieval flow
+- Pi extension entrypoint for hooks, commands, and tools
+- Helper-backed desktop runtime fallback support
 
-## Quick start
+## Install guide
+
+### Install from npm into Pi
+
+Preferred Pi install flow:
+
+```bash
+pi install npm:@lehoangvu/pi-memory-extension
+```
+
+Project-local install:
+
+```bash
+pi install -l npm:@lehoangvu/pi-memory-extension
+```
+
+### Install from the local repo
+
+```bash
+pi install ./
+```
+
+### npm global install
+
+Possible, but not the preferred Pi flow:
+
+```bash
+npm i -g @lehoangvu/pi-memory-extension
+```
+
+Pi resolves package resources from the package manifest (`pi.extensions`), so `pi install` is still the recommended path.
+
+### settings.json alternative
+
+```json
+{
+  "packages": [
+    "npm:@lehoangvu/pi-memory-extension"
+  ]
+}
+```
+
+## Quick start for contributors
 
 ### 1. Validate the schema
 
@@ -17,7 +63,20 @@ A small **Graphiti-lite** local memory prototype for a coding-agent / Pi CLI sty
 npm run check:schema
 ```
 
-### 2. Run the local demo
+### 2. Run the test suite
+
+```bash
+npm test
+```
+
+### 3. Validate the package
+
+```bash
+npm run check:package
+npm run pack:dry-run
+```
+
+### 4. Run the local demo
 
 ```bash
 npm run demo
@@ -29,11 +88,9 @@ The demo creates a local SQLite file at:
 .memory/graphiti-lite-demo.sqlite
 ```
 
-
-
 ## Publish as an npm Pi package
 
-This repo is now structured so it can be published as a **Pi package** on npm.
+This repo is structured so it can be published as a **Pi package** on npm.
 
 ### Package resources
 
@@ -50,90 +107,17 @@ This repo is now structured so it can be published as a **Pi package** on npm.
 }
 ```
 
-### Dry-run the package contents
-
-```bash
-npm run check:package
-npm run pack:dry-run
-```
-
 ### Publish
 
-If the npm package name is available and you are logged in:
-
-```bash
-npm publish
-```
-
-If you want a scoped package, rename `package.json` first, for example:
-
-```json
-{
-  "name": "@lehoangvu/pi-memory-extension"
-}
-```
-
-Then publish with:
+If you are logged in to npm and have access to the scope:
 
 ```bash
 npm publish --access public
 ```
 
-### Install into Pi
-
-Global/user-level:
-
-```bash
-pi install npm:@lehoangvu/pi-memory-extension
-```
-
-Or for a scoped package:
-
-```bash
-pi install npm:@lehoangvu/pi-memory-extension
-```
-
-Project-local install:
-
-```bash
-pi install -l npm:@lehoangvu/pi-memory-extension
-```
-
-You can also test the package without publishing:
-
-```bash
-pi install ./
-```
-
-### settings.json alternative
-
-```json
-{
-  "packages": [
-    "npm:@lehoangvu/pi-memory-extension"
-  ]
-}
-```
-
-### About `npm -g`
-
-You **can** publish this package to npm and install it globally with:
-
-```bash
-npm i -g @lehoangvu/pi-memory-extension
-```
-
-But for Pi, the preferred flow is still:
-
-```bash
-pi install npm:@lehoangvu/pi-memory-extension
-```
-
-because Pi resolves package resources from the package manifest (`pi.extensions`) rather than from npm's global install path.
-
 ## Pi CLI extension adapter
 
-This repo now also includes a **Pi CLI extension entrypoint** at:
+This repo includes a **Pi CLI extension entrypoint** at:
 
 ```text
 .pi/extensions/memory.ts
@@ -157,14 +141,6 @@ It wires the local store into the Pi extension lifecycle described in the resear
 - `/memory-remember <note>`
 - `/memory-forget <factId>`
 - `/memory-hook-debug [hook]`
-
-### Intended usage in a Pi-enabled repo
-
-1. Copy or link this extension into a Pi project under `.pi/extensions/`
-2. Ensure the Pi runtime can resolve the `src/memory/*` files
-3. Start Pi and use `/reload` after changes
-
-The extension adapter is intentionally conservative: it uses hooks + commands first, without introducing a custom remote service.
 
 ## Project layout
 
@@ -209,7 +185,6 @@ It does **not** try to implement:
 - extractors are intentionally conservative and rule-based
 - this repo is a prototype scaffold, not yet a packaged plugin
 
-
 ## Pi runtime verification checklist
 
 When you test this inside a real Pi CLI environment, verify these cases:
@@ -217,34 +192,28 @@ When you test this inside a real Pi CLI environment, verify these cases:
 1. **Extension load**
    - start Pi inside this repo
    - confirm `session_start` shows a memory-ready status/notification
-
 2. **Reload behavior**
    - edit `.pi/extensions/memory.ts`
    - run `/reload`
    - confirm the extension reinitializes cleanly
-
 3. **Prompt injection**
    - run `/memory-remember "Always use pnpm test"`
    - ask a related question
    - confirm `before_agent_start` appends the memory block
    - inspect with `/memory-why <query>`
-
 4. **Tool capture**
    - run a command through Pi that succeeds/fails
    - confirm `tool_result` writes an episode and retrievable lesson/knowledge fact
-
 5. **Checkpoint flow**
    - work in a task-scoped session
    - confirm `turn_end` writes a checkpoint visible through `/memory-checkpoint`
-
 6. **Cross-host portability**
    - prefer `notify`, `input`, `editor`, `setEditorText`, `setStatus`
    - avoid relying on `ctx.ui.custom()` until terminal-only behavior is acceptable
 
-
 ## Advanced Pi extension features included
 
-The extension now also contains the remaining production-hardening scaffolds mentioned in the research plan:
+The extension also contains the remaining production-hardening scaffolds mentioned in the research plan:
 
 - **payload verification** via `.memory/pi-hook-debug.jsonl`
 - **hook-debug command** to inspect captured hook payloads inside Pi

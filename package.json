@@ -31,9 +31,11 @@
   },
   "scripts": {
     "demo": "node --experimental-strip-types src/memory/demo.ts",
+    "test": "node --experimental-strip-types --test",
     "check:schema": "sqlite3 :memory: < sql/001_graphiti_lite_memory.sql",
     "check:package": "node --experimental-strip-types -e \"import('./extensions/memory.ts').then(() => console.log('package extension ok')).catch(err => { console.error(err); process.exit(1); })\"",
-    "pack:dry-run": "npm pack --dry-run"
+    "pack:dry-run": "npm pack --dry-run",
+    "validate": "npm run check:schema && npm run test && npm run check:package && npm run pack:dry-run"
   },
   "engines": {
     "node": ">=22.0.0"
