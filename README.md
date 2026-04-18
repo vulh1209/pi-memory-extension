@@ -2,6 +2,7 @@
 
 [![CI](https://github.com/vulh1209/pi-memory-extension/actions/workflows/ci.yml/badge.svg)](https://github.com/vulh1209/pi-memory-extension/actions/workflows/ci.yml)
 [![Publish Package](https://github.com/vulh1209/pi-memory-extension/actions/workflows/publish.yml/badge.svg)](https://github.com/vulh1209/pi-memory-extension/actions/workflows/publish.yml)
+[![npm version](https://img.shields.io/npm/v/%40lehoangvu%2Fpi-memory-extension)](https://www.npmjs.com/package/@lehoangvu/pi-memory-extension)
 
 A small **Graphiti-lite** local memory prototype for Pi CLI / coding-agent style workflows.
 
