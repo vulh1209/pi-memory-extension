@@ -1,0 +1,13 @@
+# OS
+.DS_Store
+
+# Dependencies
+node_modules/
+
+# Local runtime memory data
+.memory/*
+!.memory/.gitignore
+
+# SQLite runtime files
+.memory/*.sqlite
+.memory/*.sqlite-*

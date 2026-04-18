@@ -1,0 +1,44 @@
+{
+  "name": "@lehoangvu/pi-memory-extension",
+  "version": "0.1.1",
+  "private": false,
+  "type": "module",
+  "description": "Graphiti-lite memory extension package for Pi CLI.",
+  "keywords": [
+    "pi-package",
+    "pi-extension",
+    "agent-memory",
+    "sqlite",
+    "coding-agent"
+  ],
+  "files": [
+    "extensions/**/*.ts",
+    "src/**/*.ts",
+    "sql/**/*.sql",
+    ".pi/extensions/**/*.ts",
+    "README.md"
+  ],
+  "exports": {
+    ".": "./src/memory/index.ts",
+    "./pi-extension": "./src/memory/pi-extension.ts",
+    "./extension": "./extensions/memory.ts",
+    "./sql/001_graphiti_lite_memory.sql": "./sql/001_graphiti_lite_memory.sql"
+  },
+  "pi": {
+    "extensions": [
+      "./extensions"
+    ]
+  },
+  "scripts": {
+    "demo": "node --experimental-strip-types src/memory/demo.ts",
+    "check:schema": "sqlite3 :memory: < sql/001_graphiti_lite_memory.sql",
+    "check:package": "node --experimental-strip-types -e \"import('./extensions/memory.ts').then(() => console.log('package extension ok')).catch(err => { console.error(err); process.exit(1); })\"",
+    "pack:dry-run": "npm pack --dry-run"
+  },
+  "engines": {
+    "node": ">=22.0.0"
+  },
+  "publishConfig": {
+    "access": "public"
+  }
+}
