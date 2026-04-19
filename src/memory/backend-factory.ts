@@ -82,11 +82,12 @@ export async function createMemoryBackend(): Promise<MemoryBackend> {
 
     for (const helperSpec of helperLaunchSpecs) {
       try {
-        return await createRpcMemoryBackend({ command: helperSpec.command, args: helperSpec.args });
+        return await createRpcMemoryBackend({ command: helperSpec.command, args: helperSpec.args, env: helperSpec.env });
       } catch (error) {
         attempts.push({
           command: helperSpec.command,
           args: helperSpec.args,
+          env: helperSpec.env,
           source: helperSpec.source,
           error: error instanceof Error ? error.message : String(error),
         });

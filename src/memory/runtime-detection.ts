@@ -7,6 +7,7 @@ export type HelperLaunchSpec = {
   args: string[];
   source: 'env' | 'auto';
   target?: string;
+  env?: Record<string, string>;
 };
 
 export type MemoryRuntime =
@@ -35,6 +36,25 @@ function addExistingFileCandidate(candidates: Set<string>, value?: string) {
   }
 
   candidates.add(trimmed);
+}
+
+function getHelperEnvForCommand(command: string): Record<string, string> | undefined {
+  if (!process.versions.electron) {
+    return undefined;
+  }
+
+  if (command !== process.execPath && command !== process.argv0) {
+    return undefined;
+  }
+
+  return {
+    ELECTRON_RUN_AS_NODE: '1',
+  };
+}
+
+function helperSpecKey(spec: HelperLaunchSpec): string {
+  const envEntries = Object.entries(spec.env ?? {}).sort(([left], [right]) => left.localeCompare(right));
+  return `${spec.command}\u0000${JSON.stringify(spec.args)}\u0000${JSON.stringify(envEntries)}`;
 }
 
 export function parseHelperArgsEnv(): string[] {
@@ -133,8 +153,8 @@ export function detectMemoryRuntime(): MemoryRuntime {
     const nodeCandidates = collectKnownNodeCandidates();
 
     const addSpec = (spec: HelperLaunchSpec) => {
-      const key = `${spec.command}\u0000${JSON.stringify(spec.args)}`;
-      const seen = new Set(helperLaunchSpecs.map((entry) => `${entry.command}\u0000${JSON.stringify(entry.args)}`));
+      const key = helperSpecKey(spec);
+      const seen = new Set(helperLaunchSpecs.map((entry) => helperSpecKey(entry)));
       if (seen.has(key)) {
         return;
       }
@@ -146,6 +166,7 @@ export function detectMemoryRuntime(): MemoryRuntime {
         command: helperCommand,
         args: explicitArgs.length > 0 ? explicitArgs : fallbackArgs,
         source: 'env',
+        env: getHelperEnvForCommand(helperCommand),
       });
     }
 
@@ -161,6 +182,7 @@ export function detectMemoryRuntime(): MemoryRuntime {
             args: scriptArgs,
             source: 'env',
             target: helperPath,
+            env: getHelperEnvForCommand(command),
           });
         }
       } else {
@@ -169,6 +191,7 @@ export function detectMemoryRuntime(): MemoryRuntime {
           args: explicitArgs.length > 0 ? explicitArgs : fallbackArgs,
           source: 'env',
           target: helperPath,
+          env: getHelperEnvForCommand(helperCommand || helperPath),
         });
       }
     }
@@ -182,6 +205,7 @@ export function detectMemoryRuntime(): MemoryRuntime {
           args: autoArgs,
           source: 'auto',
           target: DEFAULT_HELPER_ENTRY,
+          env: getHelperEnvForCommand(command),
         });
       }
     }

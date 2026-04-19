@@ -14,6 +14,7 @@ A small **Graphiti-lite-inspired** local memory extension for Pi CLI / coding-ag
 - Pi extension entrypoint for hooks, commands, and tools
 - Active-task persistence in `.memory/active-task.json` for task resume flows
 - Helper-backed desktop runtime fallback support
+- Repo-local settings with enable/disable toggles and interactive TUI config
 
 ## Install guide
 
@@ -148,6 +149,9 @@ It wires the local store into the Pi extension lifecycle used by current Pi buil
 
 ### Included slash commands
 
+- `/memory-settings`
+- `/memory-enable`
+- `/memory-disable`
 - `/memory-search <query>`
 - `/memory-why <query>`
 - `/memory-inspect`
@@ -248,6 +252,7 @@ The extension also contains the remaining production-hardening scaffolds mention
 - **`memory_remember` tool** so the model can propose stable memories while still requiring user confirmation before save
 - **`memory-forget` command** to archive a fact without deleting history
 - **active task pointer** stored in `.memory/active-task.json`
+- **repo-local config** stored in `.memory/extension-config.json` with TUI settings via `/memory settings` or `/memory-settings`
 
 ### Memory writing behavior
 

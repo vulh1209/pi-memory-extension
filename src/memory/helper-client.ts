@@ -13,6 +13,7 @@ type PendingRequest = {
 type HelperClientOptions = {
   command: string;
   args?: string[];
+  env?: NodeJS.ProcessEnv;
   startupTimeoutMs?: number;
   requestTimeoutMs?: number;
 };
@@ -111,7 +112,10 @@ export function createHelperClient(options: HelperClientOptions) {
     startPromise = new Promise<ChildProcessWithoutNullStreams>((resolve, reject) => {
       const spawned = spawn(options.command, args, {
         stdio: 'pipe',
-        env: process.env,
+        env: {
+          ...process.env,
+          ...options.env,
+        },
         cwd: process.cwd(),
       });
 

@@ -14,7 +14,7 @@ import type {
 export class RpcMemoryBackend implements MemoryBackend {
   private readonly client: ReturnType<typeof createHelperClient>;
 
-  constructor(options: { command: string; args?: string[] }) {
+  constructor(options: { command: string; args?: string[]; env?: NodeJS.ProcessEnv }) {
     this.client = createHelperClient(options);
   }
 
@@ -63,7 +63,7 @@ export class RpcMemoryBackend implements MemoryBackend {
   }
 }
 
-export async function createRpcMemoryBackend(options: { command: string; args?: string[] }): Promise<MemoryBackend> {
+export async function createRpcMemoryBackend(options: { command: string; args?: string[]; env?: NodeJS.ProcessEnv }): Promise<MemoryBackend> {
   const backend = new RpcMemoryBackend(options);
 
   try {

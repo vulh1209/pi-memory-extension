@@ -8,11 +8,13 @@ import {
   clearMemoryBackendCache,
   createTaskId,
   detectRepoRoot,
+  DEFAULT_MEMORY_EXTENSION_CONFIG,
   forgetMemoryFact,
   formatActiveTask,
   formatCheckpoint,
   formatFactList,
   formatHookDebug,
+  formatMemoryExtensionConfig,
   formatMemoryHits,
   getActiveTask,
   getMemoryFactById,
@@ -23,11 +25,14 @@ import {
   loadTaskCheckpoint,
   markTaskDone,
   readHookDebug,
+  readMemoryExtensionConfig,
   rememberMemoryNote,
   saveTaskCheckpoint,
   searchProjectMemory,
   setActiveTask,
   toProjectId,
+  updateMemoryExtensionConfig,
+  type MemoryExtensionConfig,
 } from '../src/memory/pi-extension.ts';
 
 type NotifyLevel = 'info' | 'warning' | 'error' | 'warn';
@@ -38,7 +43,9 @@ type PiUi = {
   editor?: (title: string, initialValue: string) => Promise<string | undefined>;
   setEditorText?: (text: string) => void;
   setStatus?: (key: string, text: string | undefined) => void;
+  setWidget?: (key: string, value: string[] | undefined, options?: { placement?: 'aboveEditor' | 'belowEditor' }) => void;
   input?: (title: string, placeholder?: string) => Promise<string | undefined>;
+  custom?: <T = unknown>(factory: (tui: { requestRender: () => void }, theme: Record<string, unknown>, keybindings: unknown, done: (value: T) => void) => { render: (width: number) => string[]; invalidate: () => void; handleInput?: (data: string) => void; }, options?: unknown) => Promise<T>;
 };
 
 type PiContextLike = {
@@ -128,9 +135,24 @@ type MemoryExtensionRuntimeState = {
   recentToolEventsByRepo: Record<string, RecentToolEvent[]>;
   pendingDurableMemoryByRepo: Record<string, PendingDurableMemoryCandidate | undefined>;
   savedLessonKeys: string[];
+  configByRepo: Record<string, MemoryExtensionConfig | undefined>;
+};
+
+type ConfigSettingDescriptor = {
+  key: keyof MemoryExtensionConfig;
+  label: string;
+  description: string;
+};
+
+type PiEventBusLike = {
+  emit?: (eventName: string, data?: unknown) => void;
 };
 
 const STATUS_KEY = 'pi-memory';
+const WIDGET_KEY = 'pi-memory-config';
+const EDITOR_SET_STATUS_SEGMENT_EVENT = 'editor:set-status-segment';
+const EDITOR_REMOVE_STATUS_SEGMENT_EVENT = 'editor:remove-status-segment';
+const EDITOR_STATUS_SEGMENT_KEY = 'pi-memory';
 const DEBUG_HOOKS = ['session_start', 'before_agent_start', 'input', 'tool_result', 'turn_end'];
 const MEMORY_EXTENSION_RUNTIME_KEY = Symbol.for('@lehoangvu/pi-memory-extension/runtime');
 const DUPLICATE_LOAD_WARNING = 'Pi memory extension already loaded, skipping duplicate registration.';
@@ -142,6 +164,45 @@ const DURABLE_MEMORY_POLICY = [
   '- When the user confirms saving a previously discussed durable memory note, use the memory_remember tool if available instead of telling them to run /memory-remember manually.',
 ].join('\n');
 const MEMORY_USAGE_SKILL_HINT = 'Memory workflow hint: If this turn involves project memory, durable rules or preferences, lessons learned, checkpoints, or deciding whether to search, save, or forget memory, load the memory-usage skill if available before acting.';
+const CONFIG_SETTINGS: ConfigSettingDescriptor[] = [
+  { key: 'enabled', label: 'Enable automatic memory behaviors', description: 'Master switch for all automatic hooks.' },
+  { key: 'autoInjectPromptMemory', label: 'Inject relevant memory into prompts', description: 'before_agent_start appends relevant memory to the system prompt.' },
+  { key: 'autoRewriteHashMemory', label: 'Rewrite #memory prompts', description: 'input hook expands #memory prompts with relevant saved memory.' },
+  { key: 'autoCaptureToolEvents', label: 'Capture tool episodes', description: 'Track write/bash/edit runs as memory episodes.' },
+  { key: 'autoSaveCheckpoints', label: 'Save task checkpoints', description: 'Persist a checkpoint at the end of assistant turns.' },
+  { key: 'autoDetectDurableMemory', label: 'Detect durable rules/preferences', description: 'Offer to save stable project rules and preferences from chat.' },
+  { key: 'autoSaveTrapLessons', label: 'Auto-save lessons from resolved failures', description: 'Save lessons after a recent failure is clearly resolved.' },
+  { key: 'showStatusIndicator', label: 'Show memory status line', description: 'Display a compact memory status hint with the settings command.' },
+  { key: 'captureHookDebug', label: 'Capture hook debug logs', description: 'Write runtime hook payloads to .memory/pi-hook-debug.jsonl.' },
+];
+
+const MEMORY_CONFIG_PRESETS: Record<'minimal' | 'balanced' | 'full', MemoryExtensionConfig> = {
+  minimal: {
+    enabled: true,
+    autoInjectPromptMemory: true,
+    autoRewriteHashMemory: false,
+    autoCaptureToolEvents: false,
+    autoSaveCheckpoints: false,
+    autoDetectDurableMemory: false,
+    autoSaveTrapLessons: false,
+    showStatusIndicator: true,
+    captureHookDebug: false,
+  },
+  balanced: {
+    enabled: true,
+    autoInjectPromptMemory: true,
+    autoRewriteHashMemory: true,
+    autoCaptureToolEvents: true,
+    autoSaveCheckpoints: true,
+    autoDetectDurableMemory: true,
+    autoSaveTrapLessons: false,
+    showStatusIndicator: true,
+    captureHookDebug: false,
+  },
+  full: {
+    ...DEFAULT_MEMORY_EXTENSION_CONFIG,
+  },
+};
 
 export default function memoryExtension(pi: ExtensionAPI) {
   if (!claimMemoryExtensionRuntime()) {
@@ -151,30 +212,34 @@ export default function memoryExtension(pi: ExtensionAPI) {
 
   const initialize = async (hook: string, event: SessionStartEventLike | undefined, ctx: PiContextLike | undefined, announce = false) => {
     const repoRoot = getRepoRoot(ctx);
+    const config = getConfigForRepo(repoRoot);
     const status = await initializeMemoryRepo(repoRoot);
     const activeTask = getActiveTask(repoRoot);
 
-    appendHookDebug({
-      repoRoot,
-      hook,
-      payload: event,
-      derived: {
-        cwd: getCwd(ctx),
-        reason: event?.reason,
-        activeTaskId: activeTask?.taskId,
-        backendSummary: status.summary,
-        backendMode: status.mode,
-        backendDetails: status.details,
-      },
-    });
+    if (config.captureHookDebug) {
+      appendHookDebug({
+        repoRoot,
+        hook,
+        payload: event,
+        derived: {
+          cwd: getCwd(ctx),
+          reason: event?.reason,
+          activeTaskId: activeTask?.taskId,
+          backendSummary: status.summary,
+          backendMode: status.mode,
+          backendDetails: status.details,
+          enabled: config.enabled,
+        },
+      });
+    }
 
-    setStatus(ctx, formatMemoryStatusLine(status, repoRoot, activeTask?.taskId));
+    syncMemoryUi(ctx, repoRoot, status, activeTask?.taskId, config, pi.events);
 
     if (announce) {
       await ctx?.ui?.notify?.(
         activeTask
-          ? `Pi memory loaded for ${repoRoot}. ${formatMemoryStatusSummary(status)} Active task: ${activeTask.title}`
-          : `Pi memory loaded for ${repoRoot}. ${formatMemoryStatusSummary(status)}`,
+          ? `Pi memory loaded for ${repoRoot}. ${formatMemoryStatusSummary(status)} Automatic hooks: ${config.enabled ? 'on' : 'off'}. Active task: ${activeTask.title}`
+          : `Pi memory loaded for ${repoRoot}. ${formatMemoryStatusSummary(status)} Automatic hooks: ${config.enabled ? 'on' : 'off'}.`,
         status.available ? 'info' : 'warning',
       );
     }
@@ -277,11 +342,39 @@ export default function memoryExtension(pi: ExtensionAPI) {
 
     if (status.available && result) {
       rememberSavedLessonKey(issueKey);
-      setStatus(params.ctx, `memory: lesson learned saved for ${params.activeTask.taskId}`);
+      const config = getConfigForRepo(params.repoRoot);
+      setStatus(params.ctx, config.showStatusIndicator ? `memory: lesson learned saved for ${params.activeTask.taskId}` : undefined, pi.events);
     }
   };
 
+  const refreshMemoryUi = async (ctx: PiContextLike | undefined, repoRoot: string, config = getConfigForRepo(repoRoot)) => {
+    const status = await getMemoryStatus({ repoRoot });
+    syncMemoryUi(ctx, repoRoot, status, getActiveTask(repoRoot)?.taskId, config, pi.events);
+    return status;
+  };
+
+  const applyMemoryPreset = async (
+    ctx: PiContextLike,
+    presetName: 'minimal' | 'balanced' | 'full',
+    message?: string,
+  ) => {
+    const repoRoot = getRepoRoot(ctx);
+    const config = replaceConfigForRepo(repoRoot, MEMORY_CONFIG_PRESETS[presetName]);
+    await refreshMemoryUi(ctx, repoRoot, config);
+    await ctx.ui?.notify?.(message ?? `Applied memory preset: ${presetName}.`, 'info');
+    return config;
+  };
+
+  const resetMemoryConfig = async (ctx: PiContextLike) => {
+    const repoRoot = getRepoRoot(ctx);
+    const config = replaceConfigForRepo(repoRoot, DEFAULT_MEMORY_EXTENSION_CONFIG);
+    await refreshMemoryUi(ctx, repoRoot, config);
+    await ctx.ui?.notify?.('Reset memory config to defaults.', 'info');
+    return config;
+  };
+
   pi.on('session_shutdown', async () => {
+    clearEditorStatusSegment(pi.events);
     await clearMemoryBackendCache();
     releaseMemoryExtensionRuntime();
   });
@@ -292,19 +385,24 @@ export default function memoryExtension(pi: ExtensionAPI) {
 
   pi.on('before_agent_start', async (event: BeforeAgentStartEventLike, ctx: PiContextLike) => {
     const repoRoot = getRepoRoot(ctx);
+    const config = getConfigForRepo(repoRoot);
     const activeTask = getActiveTask(repoRoot);
     const query = [event.prompt?.trim(), activeTask?.title].filter(Boolean).join('\n');
 
-    appendHookDebug({
-      repoRoot,
-      hook: 'before_agent_start',
-      payload: event,
-      derived: {
-        query,
-        cwd: getCwd(ctx),
-        activeTaskId: activeTask?.taskId,
-      },
-    });
+    if (config.captureHookDebug) {
+      appendHookDebug({
+        repoRoot,
+        hook: 'before_agent_start',
+        payload: event,
+        derived: {
+          query,
+          cwd: getCwd(ctx),
+          activeTaskId: activeTask?.taskId,
+          enabled: config.enabled,
+          autoInjectPromptMemory: config.autoInjectPromptMemory,
+        },
+      });
+    }
 
     const systemPromptSections = [
       event.systemPrompt,
@@ -312,7 +410,7 @@ export default function memoryExtension(pi: ExtensionAPI) {
       shouldSuggestMemoryUsageSkill(event.prompt) ? MEMORY_USAGE_SKILL_HINT : null,
     ].filter(Boolean);
 
-    if (!query) {
+    if (!config.enabled || !config.autoInjectPromptMemory || !query) {
       return {
         systemPrompt: systemPromptSections.join('\n\n'),
       };
@@ -327,7 +425,7 @@ export default function memoryExtension(pi: ExtensionAPI) {
     });
 
     if (!memory.promptBlock) {
-      setStatus(ctx, activeTask ? `memory: task ${activeTask.taskId}, no relevant hits` : 'memory: no relevant hits');
+      setStatus(ctx, config.showStatusIndicator ? (activeTask ? `memory: task ${activeTask.taskId}, no relevant hits` : 'memory: no relevant hits') : undefined, pi.events);
       return {
         systemPrompt: systemPromptSections.join('\n\n'),
       };
@@ -335,7 +433,10 @@ export default function memoryExtension(pi: ExtensionAPI) {
 
     setStatus(
       ctx,
-      activeTask ? `memory: ${memory.hits.length} hits for ${activeTask.taskId}` : `memory: ${memory.hits.length} hits loaded`,
+      config.showStatusIndicator
+        ? (activeTask ? `memory: ${memory.hits.length} hits for ${activeTask.taskId}` : `memory: ${memory.hits.length} hits loaded`)
+        : undefined,
+      pi.events,
     );
 
     return {
@@ -351,15 +452,19 @@ export default function memoryExtension(pi: ExtensionAPI) {
     }
 
     const repoRoot = getRepoRoot(ctx);
-    appendHookDebug({
-      repoRoot,
-      hook: 'input',
-      payload: event,
-      derived: {
-        rawInput: event.text,
-        cwd: getCwd(ctx),
-      },
-    });
+    const config = getConfigForRepo(repoRoot);
+    if (config.captureHookDebug) {
+      appendHookDebug({
+        repoRoot,
+        hook: 'input',
+        payload: event,
+        derived: {
+          rawInput: event.text,
+          cwd: getCwd(ctx),
+          enabled: config.enabled,
+        },
+      });
+    }
 
     const pendingDurableMemory = getPendingDurableMemory(repoRoot);
     if (pendingDurableMemory?.awaitingUserReply) {
@@ -381,7 +486,7 @@ export default function memoryExtension(pi: ExtensionAPI) {
         clearPendingDurableMemory(repoRoot);
 
         if (status.available && result) {
-          setStatus(ctx, `memory: saved ${pendingDurableMemory.category}`);
+          setStatus(ctx, config.showStatusIndicator ? `memory: saved ${pendingDurableMemory.category}` : undefined, pi.events);
           await ctx.ui?.notify?.(`Saved to project memory: ${pendingDurableMemory.note}`, 'info');
           return {
             action: 'transform' as const,
@@ -403,7 +508,9 @@ export default function memoryExtension(pi: ExtensionAPI) {
       }
     }
 
-    const durableMemoryCandidate = detectDurableMemoryCandidate(event.text);
+    const durableMemoryCandidate = config.enabled && config.autoDetectDurableMemory
+      ? detectDurableMemoryCandidate(event.text)
+      : null;
     if (durableMemoryCandidate) {
       setPendingDurableMemory(repoRoot, durableMemoryCandidate);
 
@@ -435,7 +542,7 @@ export default function memoryExtension(pi: ExtensionAPI) {
           clearPendingDurableMemory(repoRoot);
 
           if (status.available && result) {
-            setStatus(ctx, `memory: saved ${durableMemoryCandidate.category}`);
+            setStatus(ctx, config.showStatusIndicator ? `memory: saved ${durableMemoryCandidate.category}` : undefined, pi.events);
             await ctx.ui?.notify?.(`Saved to project memory: ${durableMemoryCandidate.note}`, 'info');
           } else {
             await ctx.ui?.notify?.(`Memory unavailable: ${status.summary}`, 'warning');
@@ -449,7 +556,7 @@ export default function memoryExtension(pi: ExtensionAPI) {
       }
     }
 
-    if (!event.text.includes('#memory')) {
+    if (!config.enabled || !config.autoRewriteHashMemory || !event.text.includes('#memory')) {
       return { action: 'continue' as const };
     }
 
@@ -469,12 +576,13 @@ export default function memoryExtension(pi: ExtensionAPI) {
     }
 
     const rewritten = [cleanedInput || event.text, '', 'Relevant project memory:', memory.promptBlock].join('\n');
-    setStatus(ctx, `memory: input rewritten with ${memory.hits.length} hits`);
+    setStatus(ctx, config.showStatusIndicator ? `memory: input rewritten with ${memory.hits.length} hits` : undefined, pi.events);
     return { action: 'transform' as const, text: rewritten };
   });
 
   pi.on('tool_result', async (event: ToolResultEventLike, ctx: PiContextLike) => {
     const repoRoot = getRepoRoot(ctx);
+    const config = getConfigForRepo(repoRoot);
     const activeTask = getActiveTask(repoRoot);
     const rendered = flattenTextBlocks(event.content ?? []);
     const trackedTool = Boolean(event.toolName) && (event.isError === true || ['bash', 'edit', 'write'].includes(event.toolName ?? ''));
@@ -490,23 +598,27 @@ export default function memoryExtension(pi: ExtensionAPI) {
       });
     }
 
-    appendHookDebug({
-      repoRoot,
-      hook: 'tool_result',
-      payload: event,
-      derived: {
-        toolName: event.toolName,
-        cwd: getCwd(ctx),
-        activeTaskId: activeTask?.taskId,
-        isError: event.isError === true,
-      },
-    });
+    if (config.captureHookDebug) {
+      appendHookDebug({
+        repoRoot,
+        hook: 'tool_result',
+        payload: event,
+        derived: {
+          toolName: event.toolName,
+          cwd: getCwd(ctx),
+          activeTaskId: activeTask?.taskId,
+          isError: event.isError === true,
+          enabled: config.enabled,
+          autoCaptureToolEvents: config.autoCaptureToolEvents,
+        },
+      });
+    }
 
     if (!event.toolName) {
       return;
     }
 
-    if (!trackedTool) {
+    if (!trackedTool || !config.enabled || !config.autoCaptureToolEvents) {
       return;
     }
 
@@ -527,20 +639,24 @@ export default function memoryExtension(pi: ExtensionAPI) {
 
   pi.on('turn_end', async (event: TurnEndEventLike, ctx: PiContextLike) => {
     const repoRoot = getRepoRoot(ctx);
+    const config = getConfigForRepo(repoRoot);
     const activeTask = getActiveTask(repoRoot);
     const assistantText = getAssistantText(event.message);
 
-    appendHookDebug({
-      repoRoot,
-      hook: 'turn_end',
-      payload: event,
-      derived: {
-        activeTaskId: activeTask?.taskId,
-        assistantPreview: assistantText ? summarizeText(assistantText, 120) : undefined,
-      },
-    });
+    if (config.captureHookDebug) {
+      appendHookDebug({
+        repoRoot,
+        hook: 'turn_end',
+        payload: event,
+        derived: {
+          activeTaskId: activeTask?.taskId,
+          assistantPreview: assistantText ? summarizeText(assistantText, 120) : undefined,
+          enabled: config.enabled,
+        },
+      });
+    }
 
-    if (assistantText) {
+    if (assistantText && config.enabled && config.autoDetectDurableMemory) {
       const pendingDurableMemory = getPendingDurableMemory(repoRoot);
       const extractedAssistantCandidate = extractDurableMemoryCandidateFromAssistantOffer(assistantText);
       if (extractedAssistantCandidate) {
@@ -554,12 +670,18 @@ export default function memoryExtension(pi: ExtensionAPI) {
       return;
     }
 
-    await maybeAutoSaveResolvedTrapLesson({
-      ctx,
-      repoRoot,
-      activeTask,
-      assistantText,
-    });
+    if (config.enabled && config.autoSaveTrapLessons) {
+      await maybeAutoSaveResolvedTrapLesson({
+        ctx,
+        repoRoot,
+        activeTask,
+        assistantText,
+      });
+    }
+
+    if (!config.enabled || !config.autoSaveCheckpoints) {
+      return;
+    }
 
     const commandsRun = collectCommandHints(event.toolResults ?? []);
     await saveTaskCheckpoint({
@@ -572,7 +694,7 @@ export default function memoryExtension(pi: ExtensionAPI) {
       commandsRun,
       filesTouched: [],
     });
-    setStatus(ctx, `memory: checkpoint saved for ${activeTask.taskId}`);
+    setStatus(ctx, config.showStatusIndicator ? `memory: checkpoint saved for ${activeTask.taskId}` : undefined, pi.events);
   });
 
   pi.registerCommand('task-start', {
@@ -603,7 +725,9 @@ export default function memoryExtension(pi: ExtensionAPI) {
         nextStep: 'Inspect relevant files and implement the next change.',
       });
 
-      setStatus(ctx, `memory: active task ${activeTask.taskId}`);
+      const config = getConfigForRepo(repoRoot);
+      setStatus(ctx, config.showStatusIndicator ? `memory: active task ${activeTask.taskId}` : undefined, pi.events);
+      await refreshMemoryUi(ctx, repoRoot, config);
       await showText(ctx, 'Active task', formatActiveTask(activeTask));
     },
   });
@@ -626,7 +750,8 @@ export default function memoryExtension(pi: ExtensionAPI) {
         summary,
       });
 
-      setStatus(ctx, 'memory: no active task');
+      const config = getConfigForRepo(repoRoot);
+      await refreshMemoryUi(ctx, repoRoot, config);
       await showText(ctx, 'Task completed', `Completed ${activeTask.taskId}\n${summary}`);
     },
   });
@@ -783,6 +908,64 @@ export default function memoryExtension(pi: ExtensionAPI) {
     },
   });
 
+  pi.registerCommand('memory-settings', {
+    description: 'Open interactive memory extension settings',
+    handler: async (_args: string, ctx: PiContextLike) => {
+      await showMemorySettingsUI(ctx, pi.events);
+    },
+  });
+
+  pi.registerCommand('memory-enable', {
+    description: 'Enable automatic memory hooks for this repo',
+    handler: async (_args: string, ctx: PiContextLike) => {
+      const repoRoot = getRepoRoot(ctx);
+      saveConfigForRepo(repoRoot, { enabled: true });
+      await refreshMemoryUi(ctx, repoRoot);
+      await ctx.ui?.notify?.('Automatic memory hooks enabled.', 'info');
+    },
+  });
+
+  pi.registerCommand('memory-disable', {
+    description: 'Disable automatic memory hooks for this repo',
+    handler: async (_args: string, ctx: PiContextLike) => {
+      const repoRoot = getRepoRoot(ctx);
+      saveConfigForRepo(repoRoot, { enabled: false });
+      await refreshMemoryUi(ctx, repoRoot);
+      await ctx.ui?.notify?.('Automatic memory hooks disabled. Manual commands and tools still work.', 'info');
+    },
+  });
+
+  pi.registerCommand('memory-preset', {
+    description: 'Apply a memory preset: minimal, balanced, or full',
+    handler: async (args: string, ctx: PiContextLike) => {
+      const presetName = args.trim().toLowerCase() as 'minimal' | 'balanced' | 'full';
+      if (!presetName || !(presetName in MEMORY_CONFIG_PRESETS)) {
+        await showText(
+          ctx,
+          'Memory preset',
+          [
+            'Usage: /memory-preset <minimal|balanced|full>',
+            '',
+            'Presets:',
+            '- minimal: keep only prompt injection enabled',
+            '- balanced: practical daily-driver defaults',
+            '- full: all automatic features enabled',
+          ].join('\n'),
+        );
+        return;
+      }
+
+      await applyMemoryPreset(ctx, presetName);
+    },
+  });
+
+  pi.registerCommand('memory-reset', {
+    description: 'Reset memory config to default values',
+    handler: async (_args: string, ctx: PiContextLike) => {
+      await resetMemoryConfig(ctx);
+    },
+  });
+
   pi.registerCommand('memory', {
     description: 'Show memory status/help or run a memory subcommand',
     handler: async (args: string, ctx: PiContextLike) => {
@@ -793,9 +976,45 @@ export default function memoryExtension(pi: ExtensionAPI) {
       switch (command) {
         case '':
         case 'help':
-        case 'status': {
+        case 'status':
+        case 'config': {
           const status = await getMemoryStatus({ repoRoot });
-          await showText(ctx, 'Memory', formatMemoryOverview(status, repoRoot, activeTask?.taskId));
+          await showText(ctx, 'Memory', formatMemoryOverview(status, repoRoot, activeTask?.taskId, getConfigForRepo(repoRoot)));
+          return;
+        }
+
+        case 'settings': {
+          await showMemorySettingsUI(ctx, pi.events);
+          return;
+        }
+
+        case 'enable': {
+          saveConfigForRepo(repoRoot, { enabled: true });
+          await refreshMemoryUi(ctx, repoRoot);
+          await ctx.ui?.notify?.('Automatic memory hooks enabled.', 'info');
+          return;
+        }
+
+        case 'disable': {
+          saveConfigForRepo(repoRoot, { enabled: false });
+          await refreshMemoryUi(ctx, repoRoot);
+          await ctx.ui?.notify?.('Automatic memory hooks disabled. Manual commands and tools still work.', 'info');
+          return;
+        }
+
+        case 'preset': {
+          const presetName = rest.toLowerCase() as 'minimal' | 'balanced' | 'full';
+          if (!presetName || !(presetName in MEMORY_CONFIG_PRESETS)) {
+            await showText(ctx, 'Memory preset', 'Usage: /memory preset <minimal|balanced|full>');
+            return;
+          }
+
+          await applyMemoryPreset(ctx, presetName);
+          return;
+        }
+
+        case 'reset': {
+          await resetMemoryConfig(ctx);
           return;
         }
 
@@ -947,7 +1166,8 @@ export default function memoryExtension(pi: ExtensionAPI) {
     handler: async (_args: string, ctx: PiContextLike) => {
       const repoRoot = getRepoRoot(ctx);
       clearActiveTask({ repoRoot });
-      setStatus(ctx, 'memory: no active task');
+      const config = getConfigForRepo(repoRoot);
+      await refreshMemoryUi(ctx, repoRoot, config);
       await ctx.ui?.notify?.('Cleared active task pointer.', 'info');
     },
   });
@@ -1108,6 +1328,124 @@ function getRepoRoot(ctx?: PiContextLike): string {
   return detectRepoRoot(getCwd(ctx));
 }
 
+function getConfigForRepo(repoRoot: string): MemoryExtensionConfig {
+  const state = getMemoryExtensionRuntimeState();
+  const cached = state.configByRepo[repoRoot];
+  if (cached) {
+    return cached;
+  }
+
+  const loaded = readMemoryExtensionConfig({ repoRoot });
+  state.configByRepo[repoRoot] = loaded;
+  return loaded;
+}
+
+function saveConfigForRepo(repoRoot: string, patch: Partial<MemoryExtensionConfig>): MemoryExtensionConfig {
+  const next = updateMemoryExtensionConfig({ repoRoot, patch });
+  getMemoryExtensionRuntimeState().configByRepo[repoRoot] = next;
+  return next;
+}
+
+function replaceConfigForRepo(repoRoot: string, config: MemoryExtensionConfig): MemoryExtensionConfig {
+  const next = updateMemoryExtensionConfig({
+    repoRoot,
+    patch: config,
+  });
+  getMemoryExtensionRuntimeState().configByRepo[repoRoot] = next;
+  return next;
+}
+
+function getMemoryPresetName(config: MemoryExtensionConfig): 'minimal' | 'balanced' | 'full' | 'custom' {
+  for (const [name, preset] of Object.entries(MEMORY_CONFIG_PRESETS) as Array<[
+    'minimal' | 'balanced' | 'full',
+    MemoryExtensionConfig,
+  ]>) {
+    const matches = Object.entries(preset).every(([key, value]) => config[key as keyof MemoryExtensionConfig] === value);
+    if (matches) {
+      return name;
+    }
+  }
+
+  return 'custom';
+}
+
+function summarizeEnabledAutoFeatures(config: MemoryExtensionConfig): string[] {
+  const flags: Array<[keyof MemoryExtensionConfig, string]> = [
+    ['autoInjectPromptMemory', 'inject'],
+    ['autoRewriteHashMemory', '#memory'],
+    ['autoCaptureToolEvents', 'tools'],
+    ['autoSaveCheckpoints', 'checkpoints'],
+    ['autoDetectDurableMemory', 'durable'],
+    ['autoSaveTrapLessons', 'lessons'],
+    ['captureHookDebug', 'debug'],
+  ];
+
+  return flags
+    .filter(([key]) => config[key])
+    .map(([, label]) => label);
+}
+
+function formatMemoryIndicator(config: MemoryExtensionConfig, detail?: string): string {
+  const base = `🧠 memory ${config.enabled ? 'auto:on' : 'auto:off'}`;
+  const normalizedDetail = detail
+    ?.replace(/^memory:\s*/i, '')
+    .replace(/\s+/g, ' ')
+    .trim();
+
+  return normalizedDetail
+    ? `${base} · ${normalizedDetail} · /memory settings`
+    : `${base} · /memory settings`;
+}
+
+function formatEditorMemoryIndicator(config: MemoryExtensionConfig, detail?: string): string {
+  const base = `🧠 memory ${config.enabled ? 'auto:on' : 'auto:off'}`;
+  const normalizedDetail = detail
+    ?.replace(/^memory:\s*/i, '')
+    .replace(/\s+/g, ' ')
+    .trim();
+
+  return normalizedDetail ? `${base} · ${normalizedDetail}` : base;
+}
+
+function syncEditorStatusSegment(eventBus: PiEventBusLike | undefined, text: string | undefined): void {
+  if (!eventBus?.emit) {
+    return;
+  }
+
+  if (!text) {
+    clearEditorStatusSegment(eventBus);
+    return;
+  }
+
+  eventBus.emit(EDITOR_SET_STATUS_SEGMENT_EVENT, {
+    key: EDITOR_STATUS_SEGMENT_KEY,
+    text,
+    align: 'left',
+    priority: 20,
+  });
+}
+
+function clearEditorStatusSegment(eventBus: PiEventBusLike | undefined): void {
+  eventBus?.emit?.(EDITOR_REMOVE_STATUS_SEGMENT_EVENT, {
+    key: EDITOR_STATUS_SEGMENT_KEY,
+  });
+}
+
+function syncMemoryUi(
+  ctx: PiContextLike | undefined,
+  repoRoot: string,
+  status: MemoryStatusLike,
+  taskId: string | undefined,
+  config: MemoryExtensionConfig,
+  eventBus?: PiEventBusLike,
+): void {
+  void repoRoot;
+  void status;
+  void taskId;
+  setStatus(ctx, undefined, eventBus);
+  ctx?.ui?.setWidget?.(WIDGET_KEY, undefined, { placement: 'aboveEditor' });
+}
+
 function getCwd(ctx?: PiContextLike): string | undefined {
   return ctx?.cwd ?? process.cwd();
 }
@@ -1144,6 +1482,10 @@ function getMemoryExtensionRuntimeState(): MemoryExtensionRuntimeState {
   const runtimeStateHost = globalThis as typeof globalThis & { [key: symbol]: MemoryExtensionRuntimeState | undefined };
   const existing = runtimeStateHost[MEMORY_EXTENSION_RUNTIME_KEY];
   if (existing) {
+    existing.recentToolEventsByRepo ??= {};
+    existing.pendingDurableMemoryByRepo ??= {};
+    existing.savedLessonKeys ??= [];
+    existing.configByRepo ??= {};
     return existing;
   }
 
@@ -1153,6 +1495,7 @@ function getMemoryExtensionRuntimeState(): MemoryExtensionRuntimeState {
     recentToolEventsByRepo: {},
     pendingDurableMemoryByRepo: {},
     savedLessonKeys: [],
+    configByRepo: {},
   };
   runtimeStateHost[MEMORY_EXTENSION_RUNTIME_KEY] = created;
   return created;
@@ -1174,6 +1517,7 @@ function releaseMemoryExtensionRuntime(): void {
   state.recentToolEventsByRepo = {};
   state.pendingDurableMemoryByRepo = {};
   state.savedLessonKeys = [];
+  state.configByRepo = {};
 }
 
 function registerDuplicateLoadNoticeHooks(pi: ExtensionAPI): void {
@@ -1656,9 +2000,14 @@ function capitalizeFirst(input: string): string {
   return `${trimmed[0]!.toUpperCase()}${trimmed.slice(1)}`;
 }
 
-function formatMemoryStatusLine(status: MemoryStatusLike, repoRoot: string, taskId?: string): string {
+function formatMemoryStatusLine(status: MemoryStatusLike, repoRoot: string, taskId?: string, enabled = true): string {
   const base = status.available ? status.summary : `memory unavailable: ${status.summary}`;
-  return taskId ? `${base} · task ${taskId}` : `${base}: ${repoRoot}`;
+  const auto = enabled ? 'auto:on' : 'auto:off';
+  return taskId ? `${base} · ${auto} · task ${taskId}` : `${base} · ${auto}: ${repoRoot}`;
+}
+
+function formatMemorySettingsStatus(status: MemoryStatusLike, repoRoot: string, taskId: string | undefined, config: MemoryExtensionConfig): string {
+  return formatMemoryStatusLine(status, repoRoot, taskId, config.enabled);
 }
 
 function formatMemoryStatusSummary(status: MemoryStatusLike): string {
@@ -1667,10 +2016,10 @@ function formatMemoryStatusSummary(status: MemoryStatusLike): string {
 }
 
 function formatMemoryUnavailable(status: MemoryStatusLike, repoRoot: string, taskId?: string): string {
-  return formatMemoryOverview(status, repoRoot, taskId);
+  return formatMemoryOverview(status, repoRoot, taskId, getConfigForRepo(repoRoot));
 }
 
-function formatMemoryOverview(status: MemoryStatusLike, repoRoot: string, taskId?: string): string {
+function formatMemoryOverview(status: MemoryStatusLike, repoRoot: string, taskId?: string, config: MemoryExtensionConfig = getConfigForRepo(repoRoot)): string {
   const lines = [
     'Memory status',
     `- Repo: ${repoRoot}`,
@@ -1679,6 +2028,7 @@ function formatMemoryOverview(status: MemoryStatusLike, repoRoot: string, taskId
     `- Backend: ${status.backendKind}`,
     `- Mode: ${status.mode}`,
     `- Summary: ${status.summary}`,
+    `- Automatic hooks: ${config.enabled ? 'on' : 'off'}`,
   ];
 
   const details = formatDiagnosticDetails(status.details);
@@ -1686,10 +2036,16 @@ function formatMemoryOverview(status: MemoryStatusLike, repoRoot: string, taskId
     lines.push('', 'Diagnostics:', details);
   }
 
+  lines.push('', 'Config:', formatMemoryExtensionConfig(config));
+
   lines.push(
     '',
     'Commands:',
     '/memory',
+    '/memory config',
+    '/memory settings',
+    '/memory enable',
+    '/memory disable',
     '/memory search <query>',
     '/memory why <query>',
     '/memory inspect',
@@ -1830,6 +2186,179 @@ async function showText(ctx: PiContextLike, title: string, body: string): Promis
   await ctx.ui?.notify?.(`${title}\n${body}`, 'info');
 }
 
-function setStatus(ctx: PiContextLike | undefined, text: string): void {
-  ctx?.ui?.setStatus?.(STATUS_KEY, text);
+function setStatus(ctx: PiContextLike | undefined, text: string | undefined, eventBus?: PiEventBusLike): void {
+  const repoRoot = getRepoRoot(ctx);
+  const config = getConfigForRepo(repoRoot);
+  const footerText = config.showStatusIndicator ? formatMemoryIndicator(config, text) : undefined;
+  const editorText = config.showStatusIndicator ? formatEditorMemoryIndicator(config, text) : undefined;
+  ctx?.ui?.setStatus?.(STATUS_KEY, footerText);
+  syncEditorStatusSegment(eventBus, editorText);
+}
+
+async function showMemorySettingsUI(ctx: PiContextLike, eventBus?: PiEventBusLike): Promise<void> {
+  const repoRoot = getRepoRoot(ctx);
+  const status = await getMemoryStatus({ repoRoot });
+  const activeTask = getActiveTask(repoRoot);
+  const config = getConfigForRepo(repoRoot);
+
+  if (typeof ctx.ui?.custom !== 'function') {
+    await showText(
+      ctx,
+      'Memory settings',
+      [
+        formatMemoryOverview(status, repoRoot, activeTask?.taskId, config),
+        '',
+        'Interactive TUI is unavailable in this client.',
+        'Use /memory enable, /memory disable, /memory preset <minimal|balanced|full>, or /memory reset.',
+      ].join('\n'),
+    );
+    return;
+  }
+
+  await ctx.ui.custom<void>((tui, theme, _keybindings, done) => {
+    let selected = 0;
+    let current = { ...config };
+
+    const save = async (message?: string) => {
+      current = replaceConfigForRepo(repoRoot, current);
+      const latestStatus = await getMemoryStatus({ repoRoot });
+      syncMemoryUi(ctx, repoRoot, latestStatus, getActiveTask(repoRoot)?.taskId, current, eventBus);
+      await ctx.ui?.notify?.(message ?? `Saved memory settings (${CONFIG_SETTINGS[selected]?.label ?? 'updated'}).`, 'info');
+    };
+
+    const isThemeFn = (value: unknown): value is (text: string) => string => typeof value === 'function';
+    const fg = (name: string, value: string) => {
+      const themeRecord = theme as Record<string, unknown>;
+      return isThemeFn(themeRecord.fg) ? (themeRecord.fg as (color: string, text: string) => string)(name, value) : value;
+    };
+    const bold = (value: string) => {
+      const themeRecord = theme as Record<string, unknown>;
+      return isThemeFn(themeRecord.bold) ? (themeRecord.bold as (text: string) => string)(value) : value;
+    };
+    const border = (width: number) => fg('accent', '═'.repeat(Math.max(8, width)));
+    const selectedSetting = () => CONFIG_SETTINGS[selected] ?? CONFIG_SETTINGS[0]!;
+    const selectedValue = () => (current[selectedSetting().key] ? 'ON' : 'OFF');
+    const presetName = () => getMemoryPresetName(current);
+    const featureSummary = () => summarizeEnabledAutoFeatures(current).join(', ') || 'none';
+    const applyPresetFromUi = async (presetName: 'minimal' | 'balanced' | 'full') => {
+      current = { ...MEMORY_CONFIG_PRESETS[presetName] };
+      await save(`Applied memory preset: ${presetName}.`);
+    };
+    const resetFromUi = async () => {
+      current = { ...DEFAULT_MEMORY_EXTENSION_CONFIG };
+      await save('Reset memory config to defaults.');
+    };
+
+    const component = {
+      render(width: number): string[] {
+        const lines: string[] = [];
+        lines.push(truncateUiLine(border(width), width));
+        lines.push(truncateUiLine(fg('accent', bold(' Memory extension settings ')), width));
+        lines.push(truncateUiLine(`Repo: ${repoRoot}`, width));
+        lines.push(truncateUiLine(`Backend: ${status.summary}`, width));
+        lines.push(truncateUiLine(`Mode: ${presetName()} · auto:${current.enabled ? 'on' : 'off'} · task:${activeTask?.taskId ?? 'none'}`, width));
+        lines.push(truncateUiLine(`Features: ${featureSummary()}`, width));
+        lines.push(truncateUiLine(fg('dim', '[m] minimal   [b] balanced   [f] full   [r] reset'), width));
+        lines.push('');
+
+        for (const [index, item] of CONFIG_SETTINGS.entries()) {
+          const value = current[item.key] ? 'ON' : 'OFF';
+          const prefix = index === selected ? '▶' : '•';
+          const line = `${prefix} ${item.label}`;
+          const valueLabel = value === 'ON' ? fg('success', value) : fg('warning', value);
+          lines.push(truncateUiLine(index === selected ? fg('accent', `${line}  [${value}]`) : `${line}  [${value}]`, width));
+          lines.push(truncateUiLine(`    ${item.description}`, width));
+          if (index === selected) {
+            lines.push(truncateUiLine(`    Selected value: ${valueLabel}`, width));
+          }
+        }
+
+        lines.push('');
+        lines.push(truncateUiLine(fg('dim', '↑↓ move • space/enter toggle • e enable auto • d disable auto • esc/q close'), width));
+        lines.push(truncateUiLine(fg('dim', 'Tip: use presets first, then fine-tune individual toggles.'), width));
+        lines.push(truncateUiLine(border(width), width));
+        return lines;
+      },
+      invalidate(): void {},
+      handleInput(data: string): void {
+        if (matchesSimpleKey(data, 'up')) {
+          selected = selected > 0 ? selected - 1 : CONFIG_SETTINGS.length - 1;
+          tui.requestRender();
+          return;
+        }
+        if (matchesSimpleKey(data, 'down')) {
+          selected = selected < CONFIG_SETTINGS.length - 1 ? selected + 1 : 0;
+          tui.requestRender();
+          return;
+        }
+        if (matchesSimpleKey(data, 'escape') || data === 'q') {
+          done(undefined);
+          return;
+        }
+        if (data === 'm') {
+          void applyPresetFromUi('minimal');
+          tui.requestRender();
+          return;
+        }
+        if (data === 'b') {
+          void applyPresetFromUi('balanced');
+          tui.requestRender();
+          return;
+        }
+        if (data === 'f') {
+          void applyPresetFromUi('full');
+          tui.requestRender();
+          return;
+        }
+        if (data === 'r') {
+          void resetFromUi();
+          tui.requestRender();
+          return;
+        }
+        if (data === 'e') {
+          current = { ...current, enabled: true };
+          void save('Enabled automatic memory hooks.');
+          tui.requestRender();
+          return;
+        }
+        if (data === 'd') {
+          current = { ...current, enabled: false };
+          void save('Disabled automatic memory hooks. Manual commands still work.');
+          tui.requestRender();
+          return;
+        }
+        if (matchesSimpleKey(data, 'enter') || data === ' ') {
+          const item = CONFIG_SETTINGS[selected];
+          current = {
+            ...current,
+            [item.key]: !current[item.key],
+          };
+          void save();
+          tui.requestRender();
+        }
+      },
+    };
+
+    return component;
+  });
+}
+
+function matchesSimpleKey(data: string, key: 'up' | 'down' | 'enter' | 'escape'): boolean {
+  switch (key) {
+    case 'up':
+      return data === '\u001b[A' || data === '\u001bOA';
+    case 'down':
+      return data === '\u001b[B' || data === '\u001bOB';
+    case 'enter':
+      return data === '\r' || data === '\n';
+    case 'escape':
+      return data === '\u001b';
+  }
+}
+
+function truncateUiLine(input: string, width: number): string {
+  if (width <= 0) {
+    return '';
+  }
+  return input.length <= width ? input : `${input.slice(0, Math.max(0, width - 1))}…`;
 }

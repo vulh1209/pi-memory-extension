@@ -17,6 +17,31 @@ import { nowIso, safeJsonParse } from './utils.ts';
 const backendCache = new Map<string, Promise<MemoryBackend>>();
 const HOOK_DEBUG_FILE = 'pi-hook-debug.jsonl';
 const ACTIVE_TASK_FILE = 'active-task.json';
+const EXTENSION_CONFIG_FILE = 'extension-config.json';
+
+export type MemoryExtensionConfig = {
+  enabled: boolean;
+  autoInjectPromptMemory: boolean;
+  autoRewriteHashMemory: boolean;
+  autoCaptureToolEvents: boolean;
+  autoSaveCheckpoints: boolean;
+  autoDetectDurableMemory: boolean;
+  autoSaveTrapLessons: boolean;
+  showStatusIndicator: boolean;
+  captureHookDebug: boolean;
+};
+
+export const DEFAULT_MEMORY_EXTENSION_CONFIG: MemoryExtensionConfig = {
+  enabled: true,
+  autoInjectPromptMemory: true,
+  autoRewriteHashMemory: true,
+  autoCaptureToolEvents: true,
+  autoSaveCheckpoints: true,
+  autoDetectDurableMemory: true,
+  autoSaveTrapLessons: true,
+  showStatusIndicator: true,
+  captureHookDebug: true,
+};
 
 type HookDebugRecord = {
   timestamp: string;
@@ -33,6 +58,63 @@ function ensureMemoryDir(repoRoot: string): string {
 
 function getActiveTaskFile(repoRoot: string): string {
   return resolve(repoRoot, '.memory', ACTIVE_TASK_FILE);
+}
+
+function getExtensionConfigFile(repoRoot: string): string {
+  return resolve(repoRoot, '.memory', EXTENSION_CONFIG_FILE);
+}
+
+export function readMemoryExtensionConfig(args: { repoRoot: string }): MemoryExtensionConfig {
+  const file = getExtensionConfigFile(args.repoRoot);
+  if (!existsSync(file)) {
+    return { ...DEFAULT_MEMORY_EXTENSION_CONFIG };
+  }
+
+  const parsed = safeJsonParse<Partial<MemoryExtensionConfig> | null>(readFileSync(file, 'utf8'), null);
+  return {
+    ...DEFAULT_MEMORY_EXTENSION_CONFIG,
+    ...(parsed ?? {}),
+  };
+}
+
+export function writeMemoryExtensionConfig(args: { repoRoot: string; config: MemoryExtensionConfig }): MemoryExtensionConfig {
+  ensureMemoryDir(args.repoRoot);
+  const normalized = {
+    ...DEFAULT_MEMORY_EXTENSION_CONFIG,
+    ...args.config,
+  };
+  writeFileSync(getExtensionConfigFile(args.repoRoot), `${JSON.stringify(normalized, null, 2)}\n`, 'utf8');
+  return normalized;
+}
+
+export function updateMemoryExtensionConfig(args: { repoRoot: string; patch: Partial<MemoryExtensionConfig> }): MemoryExtensionConfig {
+  const current = readMemoryExtensionConfig({ repoRoot: args.repoRoot });
+  return writeMemoryExtensionConfig({
+    repoRoot: args.repoRoot,
+    config: {
+      ...current,
+      ...args.patch,
+    },
+  });
+}
+
+export function formatMemoryExtensionConfig(config: MemoryExtensionConfig): string {
+  const entries: Array<[string, boolean, string]> = [
+    ['enabled', config.enabled, 'Master switch for automatic memory behaviors'],
+    ['autoInjectPromptMemory', config.autoInjectPromptMemory, 'Inject relevant memory into system prompt'],
+    ['autoRewriteHashMemory', config.autoRewriteHashMemory, 'Rewrite prompts that contain #memory'],
+    ['autoCaptureToolEvents', config.autoCaptureToolEvents, 'Capture write/bash/edit tool episodes automatically'],
+    ['autoSaveCheckpoints', config.autoSaveCheckpoints, 'Save task checkpoints at end of assistant turns'],
+    ['autoDetectDurableMemory', config.autoDetectDurableMemory, 'Detect durable rules/preferences from chat and ask to save'],
+    ['autoSaveTrapLessons', config.autoSaveTrapLessons, 'Auto-save lessons after failure -> success resolution'],
+    ['showStatusIndicator', config.showStatusIndicator, 'Show footer status for this extension'],
+    ['captureHookDebug', config.captureHookDebug, 'Write hook payloads to .memory/pi-hook-debug.jsonl'],
+  ];
+
+  return [
+    'Memory extension config',
+    ...entries.map(([key, value, description]) => `- ${key}: ${value ? 'on' : 'off'}\n  ${description}`),
+  ].join('\n');
 }
 
 export function detectRepoRoot(startDir?: string): string {

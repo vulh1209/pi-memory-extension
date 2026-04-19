@@ -5,7 +5,14 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
 import memoryExtension from '../../extensions/memory.ts';
-import { clearMemoryBackendCache, inspectMemoryFacts, readActiveTask, toProjectId } from '../../src/memory/pi-extension.ts';
+import {
+  clearMemoryBackendCache,
+  inspectMemoryFacts,
+  readActiveTask,
+  readMemoryExtensionConfig,
+  rememberMemoryNote,
+  toProjectId,
+} from '../../src/memory/pi-extension.ts';
 
 const MEMORY_EXTENSION_RUNTIME_KEY = Symbol.for('@lehoangvu/pi-memory-extension/runtime');
 
@@ -21,24 +28,41 @@ type RegisteredCommand = {
   options: { handler: (args: string, ctx: unknown) => Promise<void> };
 };
 
+type EventBusHandler = (data: unknown) => void;
+
+type EmittedEvent = {
+  name: string;
+  data: unknown;
+};
+
 type MockPi = {
   handlers: Map<string, EventHandler[]>;
+  eventHandlers: Map<string, EventBusHandler[]>;
   commands: RegisteredCommand[];
   tools: RegisteredTool[];
+  emittedEvents: EmittedEvent[];
   on: (event: string, handler: EventHandler) => void;
   registerCommand: (name: string, options: RegisteredCommand['options']) => void;
   registerTool: (definition: RegisteredTool) => void;
+  events: {
+    on: (event: string, handler: EventBusHandler) => void;
+    emit: (event: string, data?: unknown) => void;
+  };
 };
 
 function createMockPi(): MockPi {
   const handlers = new Map<string, EventHandler[]>();
+  const eventHandlers = new Map<string, EventBusHandler[]>();
   const commands: RegisteredCommand[] = [];
   const tools: RegisteredTool[] = [];
+  const emittedEvents: EmittedEvent[] = [];
 
   return {
     handlers,
+    eventHandlers,
     commands,
     tools,
+    emittedEvents,
     on(event: string, handler: EventHandler) {
       const existing = handlers.get(event) ?? [];
       existing.push(handler);
@@ -49,6 +73,19 @@ function createMockPi(): MockPi {
     },
     registerTool(definition) {
       tools.push(definition);
+    },
+    events: {
+      on(event: string, handler: EventBusHandler) {
+        const existing = eventHandlers.get(event) ?? [];
+        existing.push(handler);
+        eventHandlers.set(event, existing);
+      },
+      emit(event: string, data?: unknown) {
+        emittedEvents.push({ name: event, data });
+        for (const handler of eventHandlers.get(event) ?? []) {
+          handler(data);
+        }
+      },
     },
   };
 }
@@ -129,6 +166,129 @@ test('skips duplicate memory extension registration and warns once', async () =>
   assert.match(notifications[0]?.message ?? '', /duplicate|already loaded|skipping/i);
 
   await emit(activePi, 'session_shutdown', {}, {});
+});
+
+test('memory-enable and memory-disable persist automatic hook config', async () => {
+  await resetRuntimeState();
+  const repoRoot = mkdtempSync(join(tmpdir(), 'pi-memory-ext-'));
+  const pi = createMockPi();
+  memoryExtension(pi as never);
+
+  const disableCommand = pi.commands.find((entry) => entry.name === 'memory-disable');
+  const enableCommand = pi.commands.find((entry) => entry.name === 'memory-enable');
+  assert.ok(disableCommand);
+  assert.ok(enableCommand);
+
+  await disableCommand!.options.handler('', {
+    cwd: repoRoot,
+    ui: {
+      notify: async () => {},
+      setStatus: () => {},
+    },
+  });
+
+  assert.equal(readMemoryExtensionConfig({ repoRoot }).enabled, false);
+
+  await enableCommand!.options.handler('', {
+    cwd: repoRoot,
+    ui: {
+      notify: async () => {},
+      setStatus: () => {},
+    },
+  });
+
+  assert.equal(readMemoryExtensionConfig({ repoRoot }).enabled, true);
+
+  await emit(pi, 'session_shutdown', {}, {});
+});
+
+test('status line keeps the footer visible on session start and shows runtime detail updates', async () => {
+  await resetRuntimeState();
+  const repoRoot = mkdtempSync(join(tmpdir(), 'pi-memory-ext-'));
+  const pi = createMockPi();
+  memoryExtension(pi as never);
+
+  const statuses: Array<{ key: string; text: string | undefined }> = [];
+  const ctx = {
+    cwd: repoRoot,
+    ui: {
+      notify: async () => {},
+      setStatus: (key: string, text: string | undefined) => {
+        statuses.push({ key, text });
+      },
+    },
+  };
+
+  await emit(pi, 'session_start', { reason: 'startup' }, ctx);
+  assert.equal(statuses.at(-1)?.key, 'pi-memory');
+  assert.match(statuses.at(-1)?.text ?? '', /memory auto:on/i);
+  assert.equal(pi.emittedEvents.at(-1)?.name, 'editor:set-status-segment');
+  assert.match(String((pi.emittedEvents.at(-1)?.data as { text?: string } | undefined)?.text ?? ''), /memory auto:on/i);
+
+  await emit(
+    pi,
+    'before_agent_start',
+    { prompt: 'Investigate auth bug', systemPrompt: 'Base system prompt' },
+    ctx,
+  );
+
+  assert.match(statuses.at(-1)?.text ?? '', /no relevant hits/i);
+  assert.match(statuses.at(-1)?.text ?? '', /\/memory settings/i);
+  assert.equal(pi.emittedEvents.at(-1)?.name, 'editor:set-status-segment');
+  assert.match(String((pi.emittedEvents.at(-1)?.data as { text?: string } | undefined)?.text ?? ''), /no relevant hits/i);
+
+  await emit(pi, 'session_shutdown', {}, {});
+  assert.equal(pi.emittedEvents.at(-1)?.name, 'editor:remove-status-segment');
+  assert.deepEqual(pi.emittedEvents.at(-1)?.data, { key: 'pi-memory' });
+});
+
+test('before_agent_start skips prompt memory injection when automatic hooks are disabled', async () => {
+  await resetRuntimeState();
+  const repoRoot = mkdtempSync(join(tmpdir(), 'pi-memory-ext-'));
+  const pi = createMockPi();
+  memoryExtension(pi as never);
+
+  await rememberMemoryNote({
+    repoRoot,
+    input: {
+      projectId: toProjectId(repoRoot),
+      scopeType: 'project',
+      scopeId: toProjectId(repoRoot),
+      sourceType: 'memory_note',
+      sourceName: 'test',
+      actor: 'user',
+      repoRoot,
+      content: 'Project rule: Always use pnpm test.',
+    },
+  });
+
+  const disableCommand = pi.commands.find((entry) => entry.name === 'memory-disable');
+  assert.ok(disableCommand);
+  await disableCommand!.options.handler('', { cwd: repoRoot, ui: { notify: async () => {}, setStatus: () => {} } });
+
+  const disabledResults = await emit(
+    pi,
+    'before_agent_start',
+    { prompt: 'Should I run pnpm test here?', systemPrompt: 'base system prompt' },
+    { cwd: repoRoot, ui: { setStatus: () => {} } },
+  );
+
+  assert.equal(String(disabledResults[0]?.systemPrompt).includes('Relevant project memory:'), false);
+
+  const enableCommand = pi.commands.find((entry) => entry.name === 'memory-enable');
+  assert.ok(enableCommand);
+  await enableCommand!.options.handler('', { cwd: repoRoot, ui: { notify: async () => {}, setStatus: () => {} } });
+
+  const enabledResults = await emit(
+    pi,
+    'before_agent_start',
+    { prompt: 'Should I run pnpm test here?', systemPrompt: 'base system prompt' },
+    { cwd: repoRoot, ui: { setStatus: () => {} } },
+  );
+
+  assert.equal(String(enabledResults[0]?.systemPrompt).includes('Relevant project memory:'), true);
+
+  await emit(pi, 'session_shutdown', {}, {});
 });
 
 test('task-start command persists the active task pointer', async () => {
