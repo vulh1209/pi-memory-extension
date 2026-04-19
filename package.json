@@ -1,6 +1,6 @@
 {
   "name": "@lehoangvu/pi-memory-extension",
-  "version": "0.1.2",
+  "version": "0.1.3",
   "private": false,
   "type": "module",
   "description": "Graphiti-lite memory extension package for Pi CLI.",
@@ -13,6 +13,7 @@
   ],
   "files": [
     "extensions/**/*.ts",
+    "skills/**/*.md",
     "src/**/*.ts",
     "sql/**/*.sql",
     ".pi/extensions/**/*.ts",
@@ -27,6 +28,9 @@
   "pi": {
     "extensions": [
       "./extensions"
+    ],
+    "skills": [
+      "./skills"
     ]
   },
   "scripts": {

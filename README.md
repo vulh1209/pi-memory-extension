@@ -4,14 +4,15 @@
 [![Publish Package](https://github.com/vulh1209/pi-memory-extension/actions/workflows/publish.yml/badge.svg)](https://github.com/vulh1209/pi-memory-extension/actions/workflows/publish.yml)
 [![npm version](https://img.shields.io/npm/v/%40lehoangvu%2Fpi-memory-extension)](https://www.npmjs.com/package/@lehoangvu/pi-memory-extension)
 
-A small **Graphiti-lite** local memory prototype for Pi CLI / coding-agent style workflows.
+A small **Graphiti-lite-inspired** local memory extension for Pi CLI / coding-agent workflows.
 
 ## Features
 
-- SQLite schema with temporal facts, provenance episodes, checkpoints, and FTS5
+- SQLite schema with temporal facts, provenance episodes, checkpoints, and retrieval logs
 - TypeScript repository layer using Node's built-in `node:sqlite`
-- Lightweight local hashing embedder for semantic-ish retrieval without external APIs
+- Exact-match retrieval that works even when the host SQLite build does not ship FTS5
 - Pi extension entrypoint for hooks, commands, and tools
+- Active-task persistence in `.memory/active-task.json` for task resume flows
 - Helper-backed desktop runtime fallback support
 
 ## Install guide
@@ -45,6 +46,12 @@ npm i -g @lehoangvu/pi-memory-extension
 ```
 
 Pi resolves package resources from the package manifest (`pi.extensions`), so `pi install` is still the recommended path.
+
+This package also ships a bundled skill:
+
+- `/skill:memory-usage` -> guidance for when to search memory, when to save durable notes, and how to phrase notes so they become searchable facts
+
+For memory-related prompts, the extension also injects a prompt hint that nudges the agent to load `/skill:memory-usage` when the skill is available.
 
 ### settings.json alternative
 
@@ -103,7 +110,8 @@ This repo is structured so it can be published as a **Pi package** on npm.
 {
   "keywords": ["pi-package"],
   "pi": {
-    "extensions": ["./extensions"]
+    "extensions": ["./extensions"],
+    "skills": ["./skills"]
   }
 }
 ```
@@ -124,24 +132,36 @@ This repo includes a **Pi CLI extension entrypoint** at:
 .pi/extensions/memory.ts
 ```
 
-It wires the local store into the Pi extension lifecycle described in the research docs:
+It wires the local store into the Pi extension lifecycle used by current Pi builds:
 
-- `session_start` / `session_switch` / `session_fork` / `session_tree` -> initialize or reconstruct repo-scoped memory state
+- `session_start` -> initialize repo-scoped memory state and refresh status
 - `before_agent_start` -> retrieve relevant memory and append it to the system prompt
 - `input` -> optional opt-in rewrite when the user includes `#memory` in the prompt
 - `tool_result` -> capture tool success/failure episodes
-- `turn_end` -> persist a lightweight task checkpoint
+- `turn_end` -> persist a lightweight task checkpoint and auto-save resolved trap issues as lessons when root cause + fix are clearly stated after a verified failure -> success flow
 - hook payloads are mirrored into `.memory/pi-hook-debug.jsonl` for runtime verification
+
+### Included task commands
+
+- `/task-start <title>`
+- `/task-done [summary]`
 
 ### Included slash commands
 
 - `/memory-search <query>`
 - `/memory-why <query>`
 - `/memory-inspect`
+- `/memory-rules [query]`
+- `/memory-lessons [query]`
 - `/memory-checkpoint [taskId]`
 - `/memory-remember <note>`
 - `/memory-forget <factId>`
 - `/memory-hook-debug [hook]`
+
+### Included model-callable tools
+
+- `memory_search` -> search existing project memory
+- `memory_remember` -> ask the user for confirmation, then save a stable rule/preference/lesson note into memory
 
 ## Project layout
 
@@ -160,6 +180,9 @@ src/memory/
   memory.ts
 extensions/
   memory.ts
+skills/
+  memory-usage/
+    SKILL.md
 ```
 
 ## Design notes
@@ -169,7 +192,7 @@ This prototype intentionally copies the **important semantics** from Graphiti, n
 - episodes as immutable provenance
 - facts with temporal validity windows
 - supersede old facts instead of deleting them
-- exact + semantic retrieval
+- exact-match retrieval with path/task-aware ranking
 - checkpoints for resumable task state
 
 It does **not** try to implement:
@@ -181,10 +204,10 @@ It does **not** try to implement:
 
 ## Current limitations
 
-- vector retrieval is backed by a local hashing embedder, not a production embedding model
-- semantic retrieval is simple and local-first
+- retrieval is exact-match and heuristic-ranked, not embedding-backed semantic search
 - extractors are intentionally conservative and rule-based
-- this repo is a prototype scaffold, not yet a packaged plugin
+- task completion is explicit (`/task-done`) rather than inferred automatically
+- memory is repo-local; there is no shared/team memory layer yet
 
 ## Pi runtime verification checklist
 
@@ -206,8 +229,10 @@ When you test this inside a real Pi CLI environment, verify these cases:
    - run a command through Pi that succeeds/fails
    - confirm `tool_result` writes an episode and retrievable lesson/knowledge fact
 5. **Checkpoint flow**
+   - run `/task-start fix auth redirect`
    - work in a task-scoped session
    - confirm `turn_end` writes a checkpoint visible through `/memory-checkpoint`
+   - run `/task-done` when finished and confirm the active task clears
 6. **Cross-host portability**
    - prefer `notify`, `input`, `editor`, `setEditorText`, `setStatus`
    - avoid relying on `ctx.ui.custom()` until terminal-only behavior is acceptable
@@ -218,17 +243,28 @@ The extension also contains the remaining production-hardening scaffolds mention
 
 - **payload verification** via `.memory/pi-hook-debug.jsonl`
 - **hook-debug command** to inspect captured hook payloads inside Pi
-- **conservative `input` hook**: if a prompt contains `#memory`, it is rewritten with a relevant memory block before the model sees it
+- **conservative `input` hook**: if a prompt contains `#memory`, it is rewritten using Pi's current `input` transform API before the model sees it
 - **`memory_search` tool** registered through `pi.registerTool()` so the model can query memory directly
+- **`memory_remember` tool** so the model can propose stable memories while still requiring user confirmation before save
 - **`memory-forget` command** to archive a fact without deleting history
+- **active task pointer** stored in `.memory/active-task.json`
+
+### Memory writing behavior
+
+- **User chat alone is not auto-saved by default**
+- **Stable user/project preferences** should be saved via `/memory-remember ...` or by the agent calling `memory_remember`, which asks for confirmation first
+- **Tool runs** (`bash`, `edit`, `write`) are captured automatically as episodes
+- **Trap issues** are auto-saved as `lesson` facts only when the extension sees a recent failure followed by a success and the assistant clearly states both **Root cause:** and **Fix:** in the resolution message
 
 ### Suggested runtime verification flow in Pi CLI
 
 ```text
 /reload
+/task-start fix auth redirect
 /memory-remember Always use pnpm test
 /memory-why package manager
 /memory-hook-debug before_agent_start
+/memory-checkpoint
 ```
 
 Then try a normal prompt containing `#memory` and a tool execution to confirm:

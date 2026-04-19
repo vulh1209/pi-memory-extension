@@ -24,13 +24,43 @@ function createTimeoutError(message: string): Error {
 }
 
 export function createHelperClient(options: HelperClientOptions) {
-  const startupTimeoutMs = options.startupTimeoutMs ?? 1_000;
-  const requestTimeoutMs = options.requestTimeoutMs ?? 5_000;
+  const startupTimeoutMs = options.startupTimeoutMs ?? 3_500;
+  const requestTimeoutMs = options.requestTimeoutMs ?? 10_000;
   const args = options.args ?? [];
   let child: ChildProcessWithoutNullStreams | null = null;
   let startPromise: Promise<ChildProcessWithoutNullStreams> | null = null;
   let stdoutBuffer = '';
+  let stderrBuffer = '';
+  const recentStderr: string[] = [];
   const pending = new Map<string, PendingRequest>();
+
+  const rememberStderr = (chunk: string) => {
+    stderrBuffer += chunk;
+    const lines = stderrBuffer
+      .split('\n')
+      .map((line) => line.trim())
+      .filter(Boolean);
+
+    stderrBuffer = chunk.endsWith('\n') ? '' : (lines.pop() ?? '');
+    if (lines.length === 0) {
+      return;
+    }
+
+    recentStderr.push(...lines);
+    if (recentStderr.length > 12) {
+      recentStderr.splice(0, recentStderr.length - 12);
+    }
+  };
+
+  const formatRecentStderr = () => {
+    if (recentStderr.length === 0) {
+      return '';
+    }
+
+    return ` | stderr: ${recentStderr.slice(-3).join(' | ')}`;
+  };
+
+  const createHelperError = (message: string) => new Error(`${message}${formatRecentStderr()}`);
 
   const rejectAll = (error: Error) => {
     for (const [id, request] of pending) {
@@ -49,7 +79,7 @@ export function createHelperClient(options: HelperClientOptions) {
     try {
       response = JSON.parse(line) as HelperResponse;
     } catch {
-      rejectAll(new Error(`helper emitted invalid JSON: ${line.slice(0, 200)}`));
+      rejectAll(createHelperError(`helper emitted invalid JSON: ${line.slice(0, 200)}`));
       return;
     }
 
@@ -62,7 +92,7 @@ export function createHelperClient(options: HelperClientOptions) {
     pending.delete(response.id);
 
     if (isHelperErrorResponse(response)) {
-      request.reject(new Error(response.error.message));
+      request.reject(createHelperError(response.error.message));
       return;
     }
 
@@ -82,10 +112,12 @@ export function createHelperClient(options: HelperClientOptions) {
       const spawned = spawn(options.command, args, {
         stdio: 'pipe',
         env: process.env,
+        cwd: process.cwd(),
       });
 
       const startupTimer = setTimeout(() => {
-        reject(createTimeoutError(`helper startup timeout after ${startupTimeoutMs}ms`));
+        spawned.kill();
+        reject(createHelperError(`helper startup timeout after ${startupTimeoutMs}ms for ${options.command}`));
       }, startupTimeoutMs);
 
       const cleanupStartup = () => {
@@ -106,7 +138,8 @@ export function createHelperClient(options: HelperClientOptions) {
       });
 
       spawned.stderr.setEncoding('utf8');
-      spawned.stderr.on('data', () => {
+      spawned.stderr.on('data', (chunk: string) => {
+        rememberStderr(chunk);
         // keep stderr attached for diagnostics while reserving stdout for protocol.
       });
 
@@ -118,13 +151,13 @@ export function createHelperClient(options: HelperClientOptions) {
 
       spawned.once('error', (error) => {
         cleanupStartup();
-        reject(error instanceof Error ? error : new Error(String(error)));
+        reject(createHelperError(error instanceof Error ? error.message : String(error)));
       });
 
       spawned.once('exit', (code, signal) => {
         child = null;
         cleanupStartup();
-        rejectAll(new Error(`helper exited (code=${code ?? 'null'}, signal=${signal ?? 'null'})`));
+        rejectAll(createHelperError(`helper exited (code=${code ?? 'null'}, signal=${signal ?? 'null'})`));
       });
     });
 
@@ -139,7 +172,7 @@ export function createHelperClient(options: HelperClientOptions) {
     return new Promise<unknown>((resolve, reject) => {
       const timer = setTimeout(() => {
         pending.delete(id);
-        reject(createTimeoutError(`helper request timeout for ${method} after ${requestTimeoutMs}ms`));
+        reject(createHelperError(`helper request timeout for ${method} after ${requestTimeoutMs}ms`));
       }, requestTimeoutMs);
 
       pending.set(id, { resolve, reject, timer });

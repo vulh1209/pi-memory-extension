@@ -126,6 +126,17 @@ export interface CheckpointRecord extends CheckpointInput {
   updatedAt: string;
 }
 
+export interface ActiveTaskRecord {
+  taskId: string;
+  title: string;
+  status: 'active' | 'blocked' | 'done';
+  repoRoot: string;
+  cwd?: string;
+  branch?: string;
+  startedAt: string;
+  updatedAt: string;
+}
+
 export interface SearchMemoryInput {
   query: string;
   scopeType?: ScopeType;

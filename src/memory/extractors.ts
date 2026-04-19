@@ -1,6 +1,9 @@
 import type { CandidateFact, EpisodeRecord, FactType, ScopeType, TrustLevel } from './types.ts';
 import { normalizeText } from './utils.ts';
 
+const PREFERENCE_SOURCE_TYPES = new Set(['user_message', 'memory_note', 'agent_memory_proposal']);
+const LESSON_SOURCE_TYPES = new Set(['memory_note', 'agent_memory_proposal', 'issue_resolution']);
+
 function makeFactKey(scopeType: ScopeType, scopeId: string, predicate: string, suffix?: string): string {
   return [scopeType, scopeId, predicate, suffix].filter(Boolean).join('::');
 }
@@ -43,7 +46,7 @@ export function extractCandidateFacts(episode: EpisodeRecord): CandidateFact[] {
   const metadata = episode.metadata ?? {};
   const content = episode.content;
 
-  if (episode.sourceType === 'user_message') {
+  if (PREFERENCE_SOURCE_TYPES.has(episode.sourceType)) {
     const alwaysMatch = content.match(/always use\s+(.+)/i);
     if (alwaysMatch) {
       const workflow = alwaysMatch[1].trim().replace(/[.]+$/, '');
@@ -58,6 +61,30 @@ export function extractCandidateFacts(episode: EpisodeRecord): CandidateFact[] {
           confidence: 0.95,
           trustLevel: 'human',
           tags: ['user-correction', 'workflow'],
+          sourceType: 'user_instruction',
+        }),
+      );
+    }
+
+    const generalAlwaysMatch = content.match(/^always\s+(.+)/i);
+    if (generalAlwaysMatch && !alwaysMatch) {
+      const ruleText = `Always ${generalAlwaysMatch[1].trim().replace(/[.]+$/, '')}`;
+      results.push(
+        candidate({
+          episode,
+          factType: 'rule',
+          predicate: 'project_rule',
+          factText: `${ruleText}.`,
+          objectValue: ruleText,
+          factKey: makeFactKey(
+            episode.scopeType,
+            episode.scopeId,
+            'project_rule',
+            normalizeText(ruleText),
+          ),
+          confidence: 0.95,
+          trustLevel: episode.actor === 'user' ? 'human' : 'high',
+          tags: ['project-rule', 'always'],
           sourceType: 'user_instruction',
         }),
       );
@@ -83,6 +110,150 @@ export function extractCandidateFacts(episode: EpisodeRecord): CandidateFact[] {
           trustLevel: 'human',
           tags: ['user-correction', 'forbidden'],
           sourceType: 'user_instruction',
+        }),
+      );
+    }
+
+    const generalNeverMatch = content.match(/^never\s+(.+)/i);
+    if (generalNeverMatch && !neverMatch) {
+      const ruleText = `Never ${generalNeverMatch[1].trim().replace(/[.]+$/, '')}`;
+      results.push(
+        candidate({
+          episode,
+          factType: 'rule',
+          predicate: 'project_rule',
+          factText: `${ruleText}.`,
+          objectValue: ruleText,
+          factKey: makeFactKey(
+            episode.scopeType,
+            episode.scopeId,
+            'project_rule',
+            normalizeText(ruleText),
+          ),
+          confidence: 0.97,
+          trustLevel: episode.actor === 'user' ? 'human' : 'high',
+          tags: ['project-rule', 'forbidden'],
+          sourceType: 'user_instruction',
+        }),
+      );
+    }
+
+    const preferMatch = content.match(/^prefer\s+(.+)/i);
+    if (preferMatch) {
+      const preferenceText = `Prefer ${preferMatch[1].trim().replace(/[.]+$/, '')}`;
+      results.push(
+        candidate({
+          episode,
+          factType: 'rule',
+          predicate: 'project_rule',
+          factText: `${preferenceText}.`,
+          objectValue: preferenceText,
+          factKey: makeFactKey(
+            episode.scopeType,
+            episode.scopeId,
+            'project_rule',
+            normalizeText(preferenceText),
+          ),
+          confidence: 0.92,
+          trustLevel: episode.actor === 'user' ? 'human' : 'high',
+          tags: ['project-rule', 'preference'],
+          sourceType: 'user_instruction',
+        }),
+      );
+    }
+
+    const doNotMatch = content.match(/^(?:do not|don't)\s+(.+)/i);
+    if (doNotMatch) {
+      const ruleText = `Do not ${doNotMatch[1].trim().replace(/[.]+$/, '')}`;
+      results.push(
+        candidate({
+          episode,
+          factType: 'rule',
+          predicate: 'project_rule',
+          factText: `${ruleText}.`,
+          objectValue: ruleText,
+          factKey: makeFactKey(
+            episode.scopeType,
+            episode.scopeId,
+            'project_rule',
+            normalizeText(ruleText),
+          ),
+          confidence: 0.95,
+          trustLevel: episode.actor === 'user' ? 'human' : 'high',
+          tags: ['project-rule', 'forbidden'],
+          sourceType: 'user_instruction',
+        }),
+      );
+    }
+
+    const projectRuleMatch = content.match(/project rule[:\-]\s*(.+)/i);
+    if (projectRuleMatch) {
+      const ruleText = projectRuleMatch[1].trim().replace(/[.]+$/, '');
+      results.push(
+        candidate({
+          episode,
+          factType: 'rule',
+          predicate: 'project_rule',
+          factText: `Project rule: ${ruleText}.`,
+          objectValue: ruleText,
+          factKey: makeFactKey(
+            episode.scopeType,
+            episode.scopeId,
+            'project_rule',
+            normalizeText(ruleText),
+          ),
+          confidence: 0.94,
+          trustLevel: episode.actor === 'user' ? 'human' : 'high',
+          tags: ['project-rule'],
+          sourceType: 'user_instruction',
+        }),
+      );
+    }
+  }
+
+  if (LESSON_SOURCE_TYPES.has(episode.sourceType)) {
+    const lessonMatch = content.match(/lesson learned[:\-]\s*(.+)/i);
+    const rootCause = typeof metadata.rootCause === 'string'
+      ? metadata.rootCause.trim()
+      : content.match(/root cause[:\-]\s*(.+)/i)?.[1]?.trim();
+    const fix = typeof metadata.fix === 'string'
+      ? metadata.fix.trim()
+      : content.match(/fix[:\-]\s*(.+)/i)?.[1]?.trim();
+    const trapIssue = metadata.trapIssue === true
+      || /trap issue|gotcha|pitfall|root cause/i.test(content);
+    const resolved = metadata.resolved === true
+      || /resolved|fixed|fix verified|working now/i.test(content);
+
+    const lessonText = lessonMatch?.[1]?.trim()
+      || (trapIssue && resolved && (rootCause || fix)
+        ? [
+            'Lesson learned:',
+            rootCause ? `Root cause: ${rootCause}.` : null,
+            fix ? `Fix: ${fix}.` : null,
+          ].filter(Boolean).join(' ')
+        : undefined);
+
+    if (lessonText) {
+      const issueKeySeed = typeof metadata.issueKey === 'string' && metadata.issueKey.trim()
+        ? metadata.issueKey.trim()
+        : normalizeText(rootCause || lessonText);
+      results.push(
+        candidate({
+          episode,
+          factType: 'lesson',
+          predicate: 'lesson_learned',
+          factText: lessonText.endsWith('.') ? lessonText : `${lessonText}.`,
+          objectValue: fix,
+          factKey: makeFactKey(episode.scopeType, episode.scopeId, 'lesson_learned', issueKeySeed),
+          confidence: episode.actor === 'user' ? 0.95 : 0.88,
+          trustLevel: episode.actor === 'user' ? 'human' : 'high',
+          tags: [
+            'lesson-learned',
+            ...(trapIssue ? ['trap-issue'] : []),
+            ...(resolved ? ['resolved'] : []),
+          ],
+          sourceType: episode.sourceType,
+          sourceRef: typeof metadata.sourceRef === 'string' ? metadata.sourceRef : undefined,
         }),
       );
     }

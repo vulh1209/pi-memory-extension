@@ -18,21 +18,20 @@ import type {
   SearchMemoryInput,
 } from './types.ts';
 import {
-  buildFtsQuery,
-  canCoexistPredicate,
-  cosineSimilarity,
   genId,
   isFactValidAt,
   isSingleWinnerPredicate,
+  canCoexistPredicate,
   normalizeText,
   nowIso,
   safeJsonParse,
   sha256,
+  tokenize,
 } from './utils.ts';
 
 interface StoreOptions {
   dbPath: string;
-  embedder: MemoryEmbedder;
+  embedder?: MemoryEmbedder;
   schemaPath?: string | URL;
 }
 
@@ -93,15 +92,14 @@ interface RawCheckpointRow {
 
 export class GraphitiLiteMemoryStore {
   private readonly db: DatabaseSync;
-  private readonly embedder: MemoryEmbedder;
   private readonly schemaPath: string | URL;
+  private readonly _embedder?: MemoryEmbedder;
 
   constructor(options: StoreOptions) {
     mkdirSync(dirname(options.dbPath), { recursive: true });
     this.db = new DatabaseSync(options.dbPath);
-    this.embedder = options.embedder;
-    this.schemaPath =
-      options.schemaPath ?? new URL('../../sql/001_graphiti_lite_memory.sql', import.meta.url);
+    this._embedder = options.embedder;
+    this.schemaPath = options.schemaPath ?? new URL('../../sql/001_graphiti_lite_memory.sql', import.meta.url);
     this.db.exec('PRAGMA foreign_keys = ON;');
   }
 
@@ -128,14 +126,7 @@ export class GraphitiLiteMemoryStore {
           updated_at = excluded.updated_at
       `,
       )
-      .run(
-        project.id,
-        project.repoRoot,
-        project.repoName ?? null,
-        project.defaultBranch ?? null,
-        timestamp,
-        timestamp,
-      );
+      .run(project.id, project.repoRoot, project.repoName ?? null, project.defaultBranch ?? null, timestamp, timestamp);
   }
 
   rememberEpisode(input: EpisodeInput): EpisodeRecord {
@@ -193,8 +184,7 @@ export class GraphitiLiteMemoryStore {
     const facts: IngestResult['facts'] = [];
 
     for (const candidate of candidates) {
-      const result = await this.upsertFact(candidate, episode.id);
-      facts.push(result);
+      facts.push(await this.upsertFact(candidate, episode.id));
     }
 
     return {
@@ -243,13 +233,7 @@ export class GraphitiLiteMemoryStore {
               WHERE id = ?
             `,
             )
-            .run(
-              candidate.confidence,
-              candidate.confidence,
-              sourceEpisodeId,
-              timestamp,
-              row.id,
-            );
+            .run(candidate.confidence, candidate.confidence, sourceEpisodeId, timestamp, row.id);
 
           this.db
             .prepare(
@@ -353,9 +337,7 @@ export class GraphitiLiteMemoryStore {
 
       if (shouldSupersede) {
         for (const row of existingRows) {
-          this.db
-            .prepare(`UPDATE facts SET superseded_by_fact_id = ? WHERE id = ?`)
-            .run(newFactId, row.id);
+          this.db.prepare(`UPDATE facts SET superseded_by_fact_id = ? WHERE id = ?`).run(newFactId, row.id);
           this.db
             .prepare(
               `
@@ -368,11 +350,15 @@ export class GraphitiLiteMemoryStore {
       }
 
       this.db.exec('COMMIT');
-      await this.indexFactEmbedding(newFactId);
 
       return {
         factId: newFactId,
-        action: shouldSupersede && existingRows.length > 0 ? 'superseded_previous' : existingRows.length > 0 ? 'coexisted' : 'inserted',
+        action:
+          shouldSupersede && existingRows.length > 0
+            ? 'superseded_previous'
+            : existingRows.length > 0
+              ? 'coexisted'
+              : 'inserted',
       };
     } catch (error) {
       this.db.exec('ROLLBACK');
@@ -526,13 +512,7 @@ export class GraphitiLiteMemoryStore {
         WHERE id = ?
       `,
       )
-      .run(
-        timestamp,
-        timestamp,
-        timestamp,
-        JSON.stringify({ invalidation_reason: reason }),
-        factId,
-      );
+      .run(timestamp, timestamp, timestamp, JSON.stringify({ invalidation_reason: reason }), factId);
 
     if (sourceEpisodeId) {
       this.db
@@ -547,10 +527,7 @@ export class GraphitiLiteMemoryStore {
   }
 
   getFactById(factId: string): FactRecord | null {
-    const row = this.db
-      .prepare('SELECT * FROM facts WHERE id = ? LIMIT 1')
-      .get(factId) as RawFactRow | undefined;
-
+    const row = this.db.prepare('SELECT * FROM facts WHERE id = ? LIMIT 1').get(factId) as RawFactRow | undefined;
     return row ? this.mapFactRow(row) : null;
   }
 
@@ -568,23 +545,34 @@ export class GraphitiLiteMemoryStore {
         WHERE id = ?
       `,
       )
-      .run(
-        timestamp,
-        timestamp,
-        timestamp,
-        JSON.stringify({ archived_reason: reason }),
-        factId,
-      );
+      .run(timestamp, timestamp, timestamp, JSON.stringify({ archived_reason: reason }), factId);
 
     return this.getFactById(factId);
   }
 
   async searchMemory(input: SearchMemoryInput): Promise<MemoryHit[]> {
-    const exactRows = this.exactRetrieve(input);
-    const semanticRows = await this.semanticRetrieve(input);
-    const hits = this.fuseResults(exactRows, semanticRows, input).slice(0, input.limit ?? 10);
-    this.logRetrieval(input, hits);
-    return hits;
+    const rows = this.db
+      .prepare(
+        `
+        SELECT *
+        FROM facts f
+        WHERE 1 = 1 ${this.buildFactFilterClause(input).clause}
+        ORDER BY f.updated_at DESC
+        LIMIT ?
+      `,
+      )
+      .all(...this.buildFactFilterClause(input).values, Math.max((input.limit ?? 10) * 20, 50)) as RawFactRow[];
+
+    const candidates = rows
+      .map((row) => this.mapFactRow(row))
+      .filter((fact) => this.matchesTemporalFilter(fact, input))
+      .map((fact) => this.scoreFact(fact, input))
+      .filter((hit): hit is MemoryHit => hit !== null)
+      .sort((left, right) => right.score - left.score)
+      .slice(0, input.limit ?? 10);
+
+    this.logRetrieval(input, candidates);
+    return candidates;
   }
 
   listFacts(): FactRecord[] {
@@ -592,127 +580,87 @@ export class GraphitiLiteMemoryStore {
     return rows.map((row) => this.mapFactRow(row));
   }
 
-  private exactRetrieve(input: SearchMemoryInput): FactRecord[] {
-    const query = buildFtsQuery(input.query);
-    const { clause, values } = this.buildFactFilterClause(input, { exact: true });
+  private scoreFact(fact: FactRecord, input: SearchMemoryInput): MemoryHit | null {
+    const queryTokens = tokenize(input.query);
+    const factTokens = new Set([
+      ...tokenize(fact.factText),
+      ...tokenize(fact.predicate),
+      ...tokenize(fact.objectValue ?? ''),
+      ...fact.tags.flatMap((tag) => tokenize(tag)),
+      ...tokenize(fact.pathScope ?? ''),
+      ...tokenize(fact.roleScope ?? ''),
+      ...tokenize(fact.sourceRef ?? ''),
+    ]);
 
-    try {
-      const rows = this.db
-        .prepare(
-          `
-          SELECT f.*
-          FROM facts_fts
-          JOIN facts f ON f.id = facts_fts.fact_id
-          WHERE facts_fts MATCH ? ${clause}
-          ORDER BY bm25(facts_fts), f.updated_at DESC
-          LIMIT ?
-        `,
-        )
-        .all(query, ...values, input.limit ?? 20) as RawFactRow[];
+    let exactMatches = 0;
+    const why: string[] = [];
 
-      return rows.map((row) => this.mapFactRow(row)).filter((fact) => this.matchesTemporalFilter(fact, input));
-    } catch {
-      return [];
-    }
-  }
-
-  private async semanticRetrieve(input: SearchMemoryInput): Promise<FactRecord[]> {
-    const queryEmbedding = await this.embedder.embedText(input.query);
-    const { clause, values } = this.buildFactFilterClause(input, { exact: false });
-
-    const rows = this.db
-      .prepare(
-        `
-        SELECT f.*, fe.embedding_json
-        FROM facts f
-        JOIN fact_embeddings fe ON fe.fact_id = f.id
-        WHERE 1 = 1 ${clause}
-        LIMIT 500
-      `,
-      )
-      .all(...values) as Array<RawFactRow & { embedding_json: string | null }>;
-
-    return rows
-      .map((row) => ({
-        fact: this.mapFactRow(row),
-        score: cosineSimilarity(queryEmbedding, safeJsonParse<number[]>(row.embedding_json, [])),
-      }))
-      .filter(({ fact, score }) => score > 0 && this.matchesTemporalFilter(fact, input))
-      .sort((left, right) => right.score - left.score)
-      .slice(0, input.limit ?? 20)
-      .map(({ fact }) => fact);
-  }
-
-  private fuseResults(
-    exactFacts: FactRecord[],
-    semanticFacts: FactRecord[],
-    input: SearchMemoryInput,
-  ): MemoryHit[] {
-    const seen = new Map<string, { fact: FactRecord; exactRank?: number; semanticRank?: number }>();
-
-    exactFacts.forEach((fact, index) => {
-      seen.set(fact.id, { fact, exactRank: index + 1 });
-    });
-
-    semanticFacts.forEach((fact, index) => {
-      const existing = seen.get(fact.id);
-      if (existing) {
-        existing.semanticRank = index + 1;
-      } else {
-        seen.set(fact.id, { fact, semanticRank: index + 1 });
+    for (const token of queryTokens) {
+      if (factTokens.has(token)) {
+        exactMatches += 1;
       }
-    });
+    }
 
-    return [...seen.values()]
-      .map(({ fact, exactRank, semanticRank }) => {
-        let score = 0;
-        const why: string[] = [];
+    const normalizedQuery = normalizeText(input.query);
+    if (normalizedQuery.length > 2 && fact.normalizedFact.includes(normalizedQuery)) {
+      exactMatches += 2;
+      why.push('substring-match');
+    }
 
-        if (exactRank) {
-          score += 0.4 * (1 / exactRank);
-          why.push(`exact-rank:${exactRank}`);
-        }
+    if (queryTokens.length > 0 && exactMatches === 0) {
+      return null;
+    }
 
-        if (semanticRank) {
-          score += 0.35 * (1 / semanticRank);
-          why.push(`semantic-rank:${semanticRank}`);
-        }
+    let score = exactMatches * 2;
+    if (exactMatches > 0) {
+      why.push(`exact-token-matches:${exactMatches}`);
+    }
 
-        if (fact.status === 'active') {
-          score += 0.1;
-          why.push('status:active');
-        }
+    if (input.taskId && fact.taskId === input.taskId) {
+      score += 5;
+      why.push(`task:${input.taskId}`);
+    }
 
-        if (input.pathScope && fact.pathScope === input.pathScope) {
-          score += 0.08;
-          why.push(`path-scope:${input.pathScope}`);
-        }
+    if (input.pathScope && fact.pathScope === input.pathScope) {
+      score += 4;
+      why.push(`path:${input.pathScope}`);
+    }
 
-        if (input.roleScope && fact.roleScope === input.roleScope) {
-          score += 0.04;
-          why.push(`role-scope:${input.roleScope}`);
-        }
+    if (input.roleScope && fact.roleScope === input.roleScope) {
+      score += 2;
+      why.push(`role:${input.roleScope}`);
+    }
 
-        if (input.scopeType && input.scopeId && fact.scopeType === input.scopeType && fact.scopeId === input.scopeId) {
-          score += 0.08;
-          why.push(`scope:${input.scopeType}:${input.scopeId}`);
-        }
+    if (input.scopeType && input.scopeId && fact.scopeType === input.scopeType && fact.scopeId === input.scopeId) {
+      score += 2;
+      why.push(`scope:${input.scopeType}:${input.scopeId}`);
+    }
 
-        score += Math.min(fact.confidence * 0.05, 0.05);
-        why.push(`confidence:${fact.confidence.toFixed(2)}`);
+    if (fact.status === 'active') {
+      score += 1;
+      why.push('status:active');
+    }
 
-        return {
-          factId: fact.id,
-          factText: fact.factText,
-          factType: fact.factType,
-          status: fact.status,
-          confidence: fact.confidence,
-          score,
-          why,
-          sourceEpisodeId: fact.sourceEpisodeId,
-        } satisfies MemoryHit;
-      })
-      .sort((left, right) => right.score - left.score);
+    score += Math.min(fact.confidence * 2, 2);
+    why.push(`confidence:${fact.confidence.toFixed(2)}`);
+
+    const ageDays = Math.max(0, (Date.now() - Date.parse(fact.updatedAt)) / 86_400_000);
+    const recencyBonus = Math.max(0, 1 - Math.min(ageDays, 30) / 30);
+    score += recencyBonus;
+    if (recencyBonus > 0) {
+      why.push(`recency:${recencyBonus.toFixed(2)}`);
+    }
+
+    return {
+      factId: fact.id,
+      factText: fact.factText,
+      factType: fact.factType,
+      status: fact.status,
+      confidence: fact.confidence,
+      score,
+      why,
+      sourceEpisodeId: fact.sourceEpisodeId,
+    };
   }
 
   private logRetrieval(input: SearchMemoryInput, hits: MemoryHit[]): void {
@@ -745,10 +693,7 @@ export class GraphitiLiteMemoryStore {
       );
   }
 
-  private buildFactFilterClause(
-    input: SearchMemoryInput,
-    options: { exact: boolean },
-  ): { clause: string; values: Array<string> } {
+  private buildFactFilterClause(input: SearchMemoryInput): { clause: string; values: Array<string> } {
     const conditions: string[] = [];
     const values: string[] = [];
 
@@ -783,9 +728,8 @@ export class GraphitiLiteMemoryStore {
       values.push(...input.factTypes);
     }
 
-    const prefix = options.exact ? ' AND ' : ' AND ';
     return {
-      clause: conditions.length === 0 ? '' : `${prefix}${conditions.join(' AND ')}`,
+      clause: conditions.length === 0 ? '' : ` AND ${conditions.join(' AND ')}`,
       values,
     };
   }
@@ -800,30 +744,6 @@ export class GraphitiLiteMemoryStore {
     }
 
     return fact.status === 'active';
-  }
-
-  private async indexFactEmbedding(factId: string): Promise<void> {
-    const row = this.db
-      .prepare('SELECT fact_text FROM facts WHERE id = ?')
-      .get(factId) as { fact_text: string } | undefined;
-
-    if (!row) {
-      return;
-    }
-
-    const embedding = await this.embedder.embedText(row.fact_text);
-    this.db
-      .prepare(
-        `
-        INSERT INTO fact_embeddings (fact_id, embedding_json, embedding_model, updated_at)
-        VALUES (?, ?, ?, ?)
-        ON CONFLICT(fact_id) DO UPDATE SET
-          embedding_json = excluded.embedding_json,
-          embedding_model = excluded.embedding_model,
-          updated_at = excluded.updated_at
-      `,
-      )
-      .run(factId, JSON.stringify(embedding), this.embedder.modelName, nowIso());
   }
 
   private getOrCreateEntity(projectId: string | undefined, entity: EntityRef): string {

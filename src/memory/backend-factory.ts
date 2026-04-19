@@ -1,6 +1,6 @@
 import type { ActiveFactsInput, MemoryBackend } from './backend-types.ts';
 import { unavailableStatus } from './diagnostics.ts';
-import { detectMemoryRuntime, resolveHelperPath } from './runtime-detection.ts';
+import { detectMemoryRuntime, getHelperLaunchSpecs } from './runtime-detection.ts';
 import type {
   CheckpointInput,
   CheckpointRecord,
@@ -66,18 +66,42 @@ export async function createMemoryBackend(): Promise<MemoryBackend> {
     return createLocalSqliteBackend();
   }
 
-  const helperPath = resolveHelperPath(runtime);
-  if (!helperPath) {
-    return createUnavailableMemoryBackend('desktop memory helper unavailable', { runtime: 'desktop' });
+  const helperLaunchSpecs = getHelperLaunchSpecs(runtime);
+  if (helperLaunchSpecs.length === 0) {
+    return createUnavailableMemoryBackend('desktop memory helper unavailable', {
+      runtime: 'desktop',
+      reason: 'no helper launch specs available',
+      helperLaunchSpecs,
+    });
   }
+
+  const attempts: Array<Record<string, unknown>> = [];
 
   try {
     const { createRpcMemoryBackend } = await import('./rpc-memory-backend.ts');
-    return createRpcMemoryBackend({ command: helperPath, args: runtime.helperArgs });
+
+    for (const helperSpec of helperLaunchSpecs) {
+      try {
+        return await createRpcMemoryBackend({ command: helperSpec.command, args: helperSpec.args });
+      } catch (error) {
+        attempts.push({
+          command: helperSpec.command,
+          args: helperSpec.args,
+          source: helperSpec.source,
+          error: error instanceof Error ? error.message : String(error),
+        });
+      }
+    }
   } catch (error) {
-    return createUnavailableMemoryBackend('desktop memory helper unavailable', {
-      runtime: 'desktop',
+    attempts.push({
+      stage: 'load-rpc-backend',
       error: error instanceof Error ? error.message : String(error),
     });
   }
+
+  return createUnavailableMemoryBackend('desktop memory helper unavailable', {
+    runtime: 'desktop',
+    helperLaunchSpecs,
+    attempts,
+  });
 }

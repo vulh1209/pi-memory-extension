@@ -1,3 +1,4 @@
+import { existsSync, renameSync, rmSync } from 'node:fs';
 import { resolve } from 'node:path';
 
 import { HashingEmbedder } from './hashing-embedder.ts';
@@ -42,17 +43,31 @@ async function getStore(repoRoot: string): Promise<StoreLike> {
   const created = (async () => {
     const { GraphitiLiteMemoryStore } = await import('./store.ts');
     const dbPath = resolve(normalizedRoot, '.memory/pi-memory.sqlite');
-    const store = new GraphitiLiteMemoryStore({
-      dbPath,
-      embedder: new HashingEmbedder({ dimensions: 128, modelName: 'pi-local-hashing-embedder-v1' }),
-    });
-    store.init();
-    store.createProject({
-      id: toProjectId(normalizedRoot),
-      repoRoot: normalizedRoot,
-      repoName: normalizedRoot.split(/[\\/]+/).filter(Boolean).at(-1),
-    });
-    return store as StoreLike;
+
+    const createStore = () => {
+      const store = new GraphitiLiteMemoryStore({
+        dbPath,
+        embedder: new HashingEmbedder({ dimensions: 128, modelName: 'pi-local-hashing-embedder-v1' }),
+      });
+      store.init();
+      store.createProject({
+        id: toProjectId(normalizedRoot),
+        repoRoot: normalizedRoot,
+        repoName: normalizedRoot.split(/[\\/]+/).filter(Boolean).at(-1),
+      });
+      return store as StoreLike;
+    };
+
+    try {
+      return createStore();
+    } catch (error) {
+      if (!isLegacyFts5Error(error) || !existsSync(dbPath)) {
+        throw error;
+      }
+
+      backupLegacyDatabase(dbPath);
+      return createStore();
+    }
   })();
 
   storeCache.set(normalizedRoot, created);
@@ -109,4 +124,19 @@ export class LocalSqliteMemoryBackend implements MemoryBackend {
 
 export async function createLocalSqliteBackend(): Promise<MemoryBackend> {
   return new LocalSqliteMemoryBackend();
+}
+
+function isLegacyFts5Error(error: unknown): boolean {
+  const message = error instanceof Error ? error.message : String(error);
+  return /fts5/i.test(message);
+}
+
+function backupLegacyDatabase(dbPath: string): void {
+  const timestamp = Date.now().toString(36);
+  const backupPath = `${dbPath}.legacy-fts5-${timestamp}.bak`;
+  renameSync(dbPath, backupPath);
+
+  for (const suffix of ['-shm', '-wal']) {
+    rmSync(`${dbPath}${suffix}`, { force: true });
+  }
 }

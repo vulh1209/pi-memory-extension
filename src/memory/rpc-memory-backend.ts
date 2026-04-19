@@ -22,6 +22,10 @@ export class RpcMemoryBackend implements MemoryBackend {
     await this.getStatus(repoRoot);
   }
 
+  async hello(): Promise<void> {
+    await this.client.call('helper.hello', {});
+  }
+
   async getStatus(repoRoot: string): Promise<MemoryBackendStatus> {
     return (await this.client.call('memory.status', { repoRoot })) as MemoryBackendStatus;
   }
@@ -60,5 +64,13 @@ export class RpcMemoryBackend implements MemoryBackend {
 }
 
 export async function createRpcMemoryBackend(options: { command: string; args?: string[] }): Promise<MemoryBackend> {
-  return new RpcMemoryBackend(options);
+  const backend = new RpcMemoryBackend(options);
+
+  try {
+    await backend.hello();
+    return backend;
+  } catch (error) {
+    await backend.dispose();
+    throw error;
+  }
 }

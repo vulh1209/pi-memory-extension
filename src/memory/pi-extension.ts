@@ -1,13 +1,22 @@
-import { appendFileSync, existsSync, mkdirSync, readFileSync } from 'node:fs';
+import { appendFileSync, existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { dirname, relative, resolve, sep } from 'node:path';
 
 import { createMemoryBackend } from './backend-factory.ts';
 import type { ActiveFactsInput, MemoryBackend } from './backend-types.ts';
 import type { MemoryBackendStatus } from './diagnostics.ts';
-import type { CheckpointInput, CheckpointRecord, FactRecord, IngestResult, MemoryHit } from './types.ts';
+import type {
+  ActiveTaskRecord,
+  CheckpointInput,
+  CheckpointRecord,
+  FactRecord,
+  IngestResult,
+  MemoryHit,
+} from './types.ts';
+import { nowIso, safeJsonParse } from './utils.ts';
 
 const backendCache = new Map<string, Promise<MemoryBackend>>();
 const HOOK_DEBUG_FILE = 'pi-hook-debug.jsonl';
+const ACTIVE_TASK_FILE = 'active-task.json';
 
 type HookDebugRecord = {
   timestamp: string;
@@ -16,15 +25,21 @@ type HookDebugRecord = {
   derived?: Record<string, unknown>;
 };
 
+function ensureMemoryDir(repoRoot: string): string {
+  const dir = resolve(repoRoot, '.memory');
+  mkdirSync(dir, { recursive: true });
+  return dir;
+}
+
+function getActiveTaskFile(repoRoot: string): string {
+  return resolve(repoRoot, '.memory', ACTIVE_TASK_FILE);
+}
+
 export function detectRepoRoot(startDir?: string): string {
   let current = resolve(startDir ?? process.cwd());
 
   while (true) {
-    if (
-      existsSync(resolve(current, '.git')) ||
-      existsSync(resolve(current, '.pi')) ||
-      existsSync(resolve(current, 'package.json'))
-    ) {
+    if (existsSync(resolve(current, '.git')) || existsSync(resolve(current, '.pi')) || existsSync(resolve(current, 'package.json'))) {
       return current;
     }
 
@@ -86,6 +101,85 @@ export async function getMemoryStatus(args: { repoRoot: string }): Promise<Memor
   return backend.getStatus(args.repoRoot);
 }
 
+export function readActiveTask(args: { repoRoot: string }): ActiveTaskRecord | null {
+  const file = getActiveTaskFile(args.repoRoot);
+  if (!existsSync(file)) {
+    return null;
+  }
+
+  const parsed = safeJsonParse<ActiveTaskRecord | null>(readFileSync(file, 'utf8'), null);
+  if (!parsed) {
+    return null;
+  }
+
+  return {
+    repoRoot: args.repoRoot,
+    status: 'active',
+    ...parsed,
+  };
+}
+
+export function setActiveTask(args: {
+  repoRoot: string;
+  taskId: string;
+  title: string;
+  cwd?: string;
+  branch?: string;
+}): ActiveTaskRecord {
+  const timestamp = nowIso();
+  const previous = readActiveTask({ repoRoot: args.repoRoot });
+  const next: ActiveTaskRecord = {
+    taskId: args.taskId,
+    title: args.title,
+    status: 'active',
+    repoRoot: args.repoRoot,
+    cwd: args.cwd,
+    branch: args.branch,
+    startedAt: previous?.taskId === args.taskId ? previous.startedAt : timestamp,
+    updatedAt: timestamp,
+  };
+
+  ensureMemoryDir(args.repoRoot);
+  writeFileSync(getActiveTaskFile(args.repoRoot), `${JSON.stringify(next, null, 2)}\n`, 'utf8');
+  return next;
+}
+
+export function completeActiveTask(args: { repoRoot: string; taskId?: string }): ActiveTaskRecord | null {
+  const existing = readActiveTask({ repoRoot: args.repoRoot });
+  if (!existing) {
+    return null;
+  }
+
+  if (args.taskId && existing.taskId !== args.taskId) {
+    return null;
+  }
+
+  const completed: ActiveTaskRecord = {
+    ...existing,
+    status: 'done',
+    updatedAt: nowIso(),
+  };
+
+  ensureMemoryDir(args.repoRoot);
+  writeFileSync(getActiveTaskFile(args.repoRoot), `${JSON.stringify(completed, null, 2)}\n`, 'utf8');
+  return completed;
+}
+
+export function clearActiveTask(args: { repoRoot: string }): void {
+  rmSync(getActiveTaskFile(args.repoRoot), { force: true });
+}
+
+export function createTaskId(title: string): string {
+  const slug = title
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, '-')
+    .replace(/^-+|-+$/g, '')
+    .slice(0, 48) || 'task';
+
+  return `${slug}-${Date.now().toString(36)}`;
+}
+
 export function formatMemoryHits(hits: MemoryHit[]): string {
   if (hits.length === 0) {
     return 'No relevant memory loaded.';
@@ -104,9 +198,7 @@ export function formatFactList(facts: FactRecord[]): string {
     return 'No facts found.';
   }
 
-  return facts
-    .map((fact) => `- ${fact.id} [${fact.status}] ${fact.predicate}: ${fact.factText}`)
-    .join('\n');
+  return facts.map((fact) => `- ${fact.id} [${fact.status}] ${fact.predicate}: ${fact.factText}`).join('\n');
 }
 
 export function formatCheckpoint(checkpoint: CheckpointRecord | null): string {
@@ -117,9 +209,28 @@ export function formatCheckpoint(checkpoint: CheckpointRecord | null): string {
   return [
     `Task: ${checkpoint.taskId}`,
     `Status: ${checkpoint.status}`,
+    checkpoint.title ? `Title: ${checkpoint.title}` : null,
     `Summary: ${checkpoint.summary}`,
     checkpoint.nextStep ? `Next step: ${checkpoint.nextStep}` : null,
     checkpoint.blockers ? `Blockers: ${checkpoint.blockers}` : null,
+  ]
+    .filter(Boolean)
+    .join('\n');
+}
+
+export function formatActiveTask(activeTask: ActiveTaskRecord | null): string {
+  if (!activeTask) {
+    return 'No active task.';
+  }
+
+  return [
+    `Task ID: ${activeTask.taskId}`,
+    `Title: ${activeTask.title}`,
+    `Status: ${activeTask.status}`,
+    activeTask.branch ? `Branch: ${activeTask.branch}` : null,
+    activeTask.cwd ? `CWD: ${activeTask.cwd}` : null,
+    `Started: ${activeTask.startedAt}`,
+    `Updated: ${activeTask.updatedAt}`,
   ]
     .filter(Boolean)
     .join('\n');
@@ -129,6 +240,9 @@ export async function searchProjectMemory(args: {
   repoRoot: string;
   query: string;
   limit?: number;
+  taskId?: string;
+  cwd?: string;
+  roleScope?: string;
 }): Promise<{ status: MemoryBackendStatus; hits: MemoryHit[] }> {
   const backend = await getStoreForRepo(args.repoRoot);
   await backend.initRepo(args.repoRoot);
@@ -141,6 +255,9 @@ export async function searchProjectMemory(args: {
     query: args.query,
     scopeType: 'project',
     scopeId: toProjectId(args.repoRoot),
+    pathScope: getPathScope(args.repoRoot, args.cwd),
+    taskId: args.taskId,
+    roleScope: args.roleScope,
     activeOnly: true,
     limit: args.limit ?? 8,
   });
@@ -193,6 +310,41 @@ export async function rememberMemoryNote(args: {
   return { status, result };
 }
 
+export async function seedRepoMemory(args: { repoRoot: string }): Promise<void> {
+  const packageJsonPath = resolve(args.repoRoot, 'package.json');
+  if (!existsSync(packageJsonPath)) {
+    return;
+  }
+
+  const packageJson = safeJsonParse<Record<string, unknown>>(readFileSync(packageJsonPath, 'utf8'), {});
+  const packageManager = typeof packageJson.packageManager === 'string'
+    ? packageJson.packageManager.split('@')[0]
+    : inferPackageManagerFromScripts(packageJson.scripts);
+
+  if (!packageManager) {
+    return;
+  }
+
+  await rememberMemoryNote({
+    repoRoot: args.repoRoot,
+    input: {
+      projectId: toProjectId(args.repoRoot),
+      scopeType: 'project',
+      scopeId: toProjectId(args.repoRoot),
+      sourceType: 'repo_scan',
+      sourceName: 'package.json',
+      actor: 'system',
+      repoRoot: args.repoRoot,
+      content: `Detected package manager ${packageManager}`,
+      metadata: {
+        kind: 'package_json',
+        path: packageJsonPath,
+        packageManager,
+      },
+    },
+  });
+}
+
 export async function buildPromptMemory(args: {
   repoRoot: string;
   query: string;
@@ -233,12 +385,11 @@ export async function buildPromptMemory(args: {
 
   const checkpoint = args.taskId ? await backend.loadCheckpoint(args.repoRoot, args.taskId) : null;
   const memoryLines = hits.map((hit) => `- [${hit.factType}] ${hit.factText}`);
-
   const checkpointLines = checkpoint
     ? [
-        `Checkpoint summary: ${checkpoint.summary}`,
-        checkpoint.nextStep ? `Checkpoint next step: ${checkpoint.nextStep}` : null,
-        checkpoint.blockers ? `Checkpoint blockers: ${checkpoint.blockers}` : null,
+        `- [checkpoint] ${checkpoint.summary}`,
+        checkpoint.nextStep ? `- [next-step] ${checkpoint.nextStep}` : null,
+        checkpoint.blockers ? `- [blockers] ${checkpoint.blockers}` : null,
       ].filter(Boolean)
     : [];
 
@@ -299,10 +450,14 @@ export async function captureToolEpisode(args: {
 export async function saveTaskCheckpoint(args: {
   repoRoot: string;
   taskId: string;
+  title?: string;
+  status?: CheckpointRecord['status'];
   summary: string;
   nextStep?: string;
   blockers?: string;
   cwd?: string;
+  filesTouched?: string[];
+  commandsRun?: string[];
   sourceEpisodeId?: string;
 }): Promise<{ checkpointId: string } | null> {
   const backend = await getStoreForRepo(args.repoRoot);
@@ -319,15 +474,51 @@ export async function saveTaskCheckpoint(args: {
     taskId: args.taskId,
     scopeType: 'task',
     scopeId: args.taskId,
-    status: args.blockers ? 'blocked' : 'active',
+    status: args.status ?? (args.blockers ? 'blocked' : 'active'),
+    title: args.title,
     summary: args.summary,
     nextStep: args.nextStep,
     blockers: args.blockers,
-    filesTouched: pathScope ? [pathScope] : [],
+    filesTouched: [...new Set([...(args.filesTouched ?? []), ...(pathScope ? [pathScope] : [])])],
+    commandsRun: args.commandsRun,
     sourceEpisodeId: args.sourceEpisodeId,
   };
 
   return backend.saveCheckpoint(args.repoRoot, checkpoint);
+}
+
+export function getActiveTask(repoRoot: string): ActiveTaskRecord | null {
+  return readActiveTask({ repoRoot });
+}
+
+export async function loadActiveTaskCheckpoint(args: {
+  repoRoot: string;
+}): Promise<{ activeTask: ActiveTaskRecord | null; checkpoint: CheckpointRecord | null }> {
+  const activeTask = readActiveTask({ repoRoot: args.repoRoot });
+  if (!activeTask) {
+    return { activeTask: null, checkpoint: null };
+  }
+
+  const { checkpoint } = await loadTaskCheckpoint({ repoRoot: args.repoRoot, taskId: activeTask.taskId });
+  return { activeTask, checkpoint };
+}
+
+export async function markTaskDone(args: {
+  repoRoot: string;
+  taskId: string;
+  title?: string;
+  summary: string;
+}): Promise<{ checkpointId: string } | null> {
+  completeActiveTask({ repoRoot: args.repoRoot, taskId: args.taskId });
+  const result = await saveTaskCheckpoint({
+    repoRoot: args.repoRoot,
+    taskId: args.taskId,
+    title: args.title,
+    status: 'done',
+    summary: args.summary,
+  });
+  clearActiveTask({ repoRoot: args.repoRoot });
+  return result;
 }
 
 export async function forgetMemoryFact(args: {
@@ -363,8 +554,7 @@ export function appendHookDebug(args: {
   payload: unknown;
   derived?: Record<string, unknown>;
 }): void {
-  const dir = resolve(args.repoRoot, '.memory');
-  mkdirSync(dir, { recursive: true });
+  const dir = ensureMemoryDir(args.repoRoot);
   const record: HookDebugRecord = {
     timestamp: new Date().toISOString(),
     hook: args.hook,
@@ -412,6 +602,24 @@ export function formatHookDebug(records: HookDebugRecord[]): string {
       return `${index + 1}. [${record.timestamp}] ${record.hook}${derived}\nPayload: ${JSON.stringify(record.payload, null, 2)}`;
     })
     .join('\n\n');
+}
+
+function inferPackageManagerFromScripts(scripts: unknown): string | undefined {
+  if (!scripts || typeof scripts !== 'object') {
+    return undefined;
+  }
+
+  const text = JSON.stringify(scripts);
+  if (/pnpm/i.test(text)) {
+    return 'pnpm';
+  }
+  if (/yarn/i.test(text)) {
+    return 'yarn';
+  }
+  if (/npm/i.test(text)) {
+    return 'npm';
+  }
+  return undefined;
 }
 
 function extractCommand(input: unknown): string | undefined {
